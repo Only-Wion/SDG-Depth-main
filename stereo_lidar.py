@@ -292,6 +292,7 @@ def main(args):
     epoch_metrics_path = Path(args.checkpoint_dir) / 'epoch_metrics.jsonl'
     epoch_metrics_csv_path = Path(args.checkpoint_dir) / 'epoch_metrics.csv'
 
+    best_val_rmse = float('inf')
     if args.local_rank == 0 and args.first_test:
         if args.resume_ckpt is not None:
             validate(model.module, args=args, completion_split=args.first_test_type)
@@ -403,7 +404,7 @@ def main(args):
 
             if total_steps % args.save_latest_ckpt_freq == 0:
                 if args.local_rank == 0:
-                    save_path = Path(args.checkpoint_dir + '/ckpt_latest.pth')
+                    save_path = Path(args.checkpoint_dir) / 'ckpt_last.pth'
                     torch.save({'model': model_without_ddp.state_dict(),
                                 'optimizer': optimizer.state_dict(),
                                 'step': total_steps,
@@ -436,18 +437,25 @@ def main(args):
         if args.lr_scheduler_type == 'MultiStepLR':
             scheduler.step()
 
-        if args.local_rank == 0 and (
-                (epoch + 1) % args.val_epoch == 0 or (epoch + 1) == args.num_epoch):
-            logging.info(f'Save checkpoint at step: {total_steps}')
-            save_path = Path(args.checkpoint_dir + '/%06d.pth' % total_steps)
-            logging.info(f"Saving file {save_path.absolute()}")
+        if args.local_rank == 0:
+            last_path = Path(args.checkpoint_dir) / 'ckpt_last.pth'
+            logging.info(f"Saving last checkpoint: {last_path.absolute()}")
             torch.save({'model': model_without_ddp.state_dict(),
                         'optimizer': optimizer.state_dict(),
                         'step': total_steps,
-                        'epoch': epoch + 1}, save_path)
+                        'epoch': epoch + 1}, last_path)
 
         if args.local_rank == 0 and ((epoch + 1) % args.val_epoch == 0 or (epoch + 1) == args.num_epoch):
-            validate(model.module, args=args)
+            val_metrics = validate(model.module, args=args)
+            if val_metrics is not None and val_metrics.get('rmse', float('inf')) < best_val_rmse:
+                best_val_rmse = val_metrics['rmse']
+                best_path = Path(args.checkpoint_dir) / 'ckpt_best.pth'
+                logging.info(f"Saving best checkpoint: {best_path.absolute()} rmse={best_val_rmse}")
+                torch.save({'model': model_without_ddp.state_dict(),
+                            'optimizer': optimizer.state_dict(),
+                            'step': total_steps,
+                            'epoch': epoch + 1,
+                            'val_metrics': val_metrics}, best_path)
             model.train()
 
         epoch += 1

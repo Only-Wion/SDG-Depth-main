@@ -138,9 +138,13 @@ def validate(model, args, mixed_prec=False, completion_split='val'):
     mape = mape_sum / (rmse_num + 1e-6)
     imae = imae_sum / (rmse_num + 1e-6)
     irmse = irmse_sum / (rmse_num + 1e-6)
+    metrics = {
+        'mae': mae.item(),
+        'rmse': rmse.item(),
+        'mape_percent': mape.item(),
+        'imae': imae.item(),
+        'irmse': irmse.item(),
+    }
     print(
-        f"mae:{round(mae.item(), 6)}, rmse: {round(rmse.item(), 5)}, mape_percent:{round(mape.item(), 4)}, imae: {round(imae.item(), 7)}, irmse:{round(irmse.item(), 7)}")
-    return
-
-
-
+        f"mae:{round(metrics['mae'], 6)}, rmse: {round(metrics['rmse'], 5)}, mape_percent:{round(metrics['mape_percent'], 4)}, imae: {round(metrics['imae'], 7)}, irmse:{round(metrics['irmse'], 7)}")
+    return metrics
