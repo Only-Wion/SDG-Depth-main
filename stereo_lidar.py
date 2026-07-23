@@ -55,6 +55,7 @@ parser.add_argument('--luna_root', default='D:/batch_organized', type=str, help=
 parser.add_argument('--luna_resize', type=int, nargs='*', default=[768, 1024], help='resize Luna images/depth to H W; pass no values to keep original size')
 parser.add_argument('--luna_depth_scale', default=1.0 / 256.0, type=float, help='scale from uint16 depth PNG value to meters')
 parser.add_argument('--luna_val_fraction', default=0.2, type=float, help='deterministic validation fraction for Luna data')
+parser.add_argument('--luna_test_fraction', default=None, type=float, help='deterministic test fraction for Luna data; defaults to luna_val_fraction')
 parser.add_argument('--luna_lidar_max_time_diff_ns', default=100000000, type=int, help='maximum image-LiDAR timestamp gap for Luna hints')
 parser.add_argument('--luna_require_lidar', default=1, type=int, help='skip Luna samples without matched raw LiDAR when 1')
 parser.add_argument('--luna_camera_key', default='Cam_Rect_L', type=str, help='intrinsics key used for Luna projection')
@@ -436,3 +437,4 @@ if __name__ == '__main__':
     torch.backends.cudnn.benchmark = True
 
     main(args)
+

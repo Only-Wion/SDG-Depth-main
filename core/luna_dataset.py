@@ -117,26 +117,37 @@ class LunaOrganized(data.Dataset):
         if skipped_no_lidar:
             logging.warning(f'Skipped {skipped_no_lidar} Luna samples without a matched raw LiDAR frame')
 
-        if image_set == 'training':
-            return self._split_samples(all_samples, training=True)
-        if image_set in ['val', 'test']:
-            return self._split_samples(all_samples, training=False)
+        if image_set in ['training', 'val', 'test']:
+            return self._split_samples(all_samples, image_set=image_set)
         return all_samples
 
-    def _split_samples(self, samples, training):
+    def _split_samples(self, samples, image_set):
         val_fraction = float(getattr(self.args, 'luna_val_fraction', 0.2))
-        if len(samples) == 0 or val_fraction <= 0:
-            return samples if training else []
-        val_num = int(round(len(samples) * val_fraction))
-        val_num = min(max(val_num, 1), len(samples))
+        test_fraction_arg = getattr(self.args, 'luna_test_fraction', None)
+        test_fraction = val_fraction if test_fraction_arg is None else float(test_fraction_arg)
+        if len(samples) == 0:
+            return []
+        val_num = int(round(len(samples) * val_fraction)) if val_fraction > 0 else 0
+        test_num = int(round(len(samples) * test_fraction)) if test_fraction > 0 else 0
+        if val_fraction > 0:
+            val_num = min(max(val_num, 1), len(samples))
+        if test_fraction > 0:
+            test_num = min(max(test_num, 1), len(samples) - val_num)
+        if val_num + test_num >= len(samples):
+            overflow = val_num + test_num - len(samples) + 1
+            test_num = max(0, test_num - overflow)
         state = np.random.get_state()
         np.random.seed(1000)
-        val_idxs = set(np.random.permutation(len(samples))[:val_num])
+        split_idxs = np.random.permutation(len(samples))
         np.random.set_state(state)
-        if training:
-            return [sample for idx, sample in enumerate(samples) if idx not in val_idxs]
-        return [sample for idx, sample in enumerate(samples) if idx in val_idxs]
-
+        val_idxs = set(split_idxs[:val_num])
+        test_idxs = set(split_idxs[val_num:val_num + test_num])
+        if image_set == 'val':
+            return [sample for idx, sample in enumerate(samples) if idx in val_idxs]
+        if image_set == 'test':
+            return [sample for idx, sample in enumerate(samples) if idx in test_idxs]
+        holdout_idxs = val_idxs | test_idxs
+        return [sample for idx, sample in enumerate(samples) if idx not in holdout_idxs]
     def _read_calibration(self, calib_dir):
         intrinsics = json.load(open(calib_dir / 'intrinsics.json', 'r', encoding='utf-8'))
         extrinsics = json.load(open(calib_dir / 'extrinsics.json', 'r', encoding='utf-8'))
@@ -340,3 +351,5 @@ class LunaOrganized(data.Dataset):
             return self.image_list[index] + [self.disparity_list[index]], img1, img2, flow, valid.float(), flow_hints, conversion_rate
 
         return self.image_list[index] + [self.disparity_list[index]], img1, img2, flow, valid.float(), conversion_rate
+
+

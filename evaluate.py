@@ -45,7 +45,7 @@ def validate(model, args, mixed_prec=False, completion_split='val'):
         raise ValueError(f"Unknown test dataset: {args.test_datasets}")
 
     rmse_num = 0
-    mae_sum, rmse_sum, imae_sum, irmse_sum = 0, 0, 0, 0
+    mae_sum, rmse_sum, imae_sum, irmse_sum, mape_sum = 0, 0, 0, 0, 0
 
     depth_range_min = args.eval_depth_range_min
     depth_range_max = args.eval_depth_range_max
@@ -107,6 +107,7 @@ def validate(model, args, mixed_prec=False, completion_split='val'):
         depth_est = depth_pr[valid_tmp]
         depth_gt = conversion_rate[valid_tmp] / flow_gt[valid_tmp]
         mae = torch.abs(depth_gt - depth_est).mean()
+        mape = (torch.abs(depth_gt - depth_est) / torch.clamp(depth_gt, min=1e-6)).mean() * 100.0
         rmse = torch.sqrt(F.mse_loss(depth_est, depth_gt))
         imae = torch.abs(
             flow_pr[valid_tmp] / conversion_rate[valid_tmp] - flow_gt[
@@ -114,6 +115,7 @@ def validate(model, args, mixed_prec=False, completion_split='val'):
         irmse = torch.sqrt(F.mse_loss(flow_pr[valid_tmp] / conversion_rate[valid_tmp],
                                       flow_gt[valid_tmp] / conversion_rate[valid_tmp]))
         mae_sum += mae
+        mape_sum += mape
         rmse_sum += rmse
         rmse_num += 1
         imae_sum += imae
@@ -121,8 +123,10 @@ def validate(model, args, mixed_prec=False, completion_split='val'):
     
     mae = mae_sum / (rmse_num + 1e-6)
     rmse = rmse_sum / (rmse_num + 1e-6)
+    mape = mape_sum / (rmse_num + 1e-6)
     imae = imae_sum / (rmse_num + 1e-6)
     irmse = irmse_sum / (rmse_num + 1e-6)
     print(
-        f"mae:{round(mae.item(), 6)}, rmse: {round(rmse.item(), 5)}, imae: {round(imae.item(), 7)}, irmse:{round(irmse.item(), 7)}")
+        f"mae:{round(mae.item(), 6)}, rmse: {round(rmse.item(), 5)}, mape_percent:{round(mape.item(), 4)}, imae: {round(imae.item(), 7)}, irmse:{round(irmse.item(), 7)}")
     return
+
