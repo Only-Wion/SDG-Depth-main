@@ -54,6 +54,8 @@ parser.add_argument('--num_workers', type=int, default=8, help="num_workers")
 parser.add_argument('--train_datasets', nargs='+', default=['kitti_completion'], help="training datasets.")
 parser.add_argument('--test_datasets', default='kitti_completion', type=str)
 parser.add_argument('--luna_root', default='D:/batch_organized', type=str, help='root directory for luna organized data')
+parser.add_argument('--luna_exclude_sequences', nargs='*', default=[],
+                    help='Luna sequence directory names to exclude before train/val/test splitting')
 parser.add_argument('--luna_resize', type=int, nargs='*', default=[768, 1024], help='resize Luna images/depth to H W; pass no values to keep original size')
 parser.add_argument('--luna_depth_scale', default=1.0 / 256.0, type=float, help='scale from uint16 depth PNG value to meters')
 parser.add_argument('--luna_val_fraction', default=0.2, type=float, help='deterministic validation fraction for Luna data')

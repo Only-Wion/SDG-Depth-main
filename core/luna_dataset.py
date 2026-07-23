@@ -71,7 +71,12 @@ class LunaOrganized(data.Dataset):
     def _collect_samples(self, image_set):
         all_samples = []
         skipped_no_lidar = 0
+        excluded_sequences = set(getattr(self.args, 'luna_exclude_sequences', []) or [])
+        if excluded_sequences:
+            logging.info(f'Excluding Luna sequences: {sorted(excluded_sequences)}')
         for seq in sorted([p for p in self.root.iterdir() if p.is_dir()]):
+            if seq.name in excluded_sequences:
+                continue
             if not (seq / 'manifest.json').exists() and not (seq / 'calibration').exists():
                 continue
             left_dir = seq / 'images' / 'left'
