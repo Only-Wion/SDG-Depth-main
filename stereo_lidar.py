@@ -1,5 +1,7 @@
 from __future__ import print_function, division
 import argparse
+import csv
+import json
 from loguru import logger as logging
 import numpy as np
 from pathlib import Path
@@ -286,6 +288,9 @@ def main(args):
     epoch = start_epoch
     total_steps = start_step
     time_steps = 0
+    epoch_metric_keys = ['loss', 'epe', '1px', '3px', '5px', 'mae', 'rmse', 'imae', 'irmse']
+    epoch_metrics_path = Path(args.checkpoint_dir) / 'epoch_metrics.jsonl'
+    epoch_metrics_csv_path = Path(args.checkpoint_dir) / 'epoch_metrics.csv'
 
     if args.local_rank == 0 and args.first_test:
         if args.resume_ckpt is not None:
@@ -296,6 +301,9 @@ def main(args):
     while should_keep_training:
 
         model.train()
+        epoch_sums = {key: 0.0 for key in epoch_metric_keys}
+        epoch_count = 0
+        epoch_start_step = total_steps
 
         for i_batch, (_, *data_blob) in enumerate(train_loader):
 
@@ -369,8 +377,15 @@ def main(args):
                 total_steps += 1
                 continue
 
+            loss_value = loss.item()
+            metrics_with_loss = dict(metrics)
+            metrics_with_loss['loss'] = loss_value
+            for key in epoch_metric_keys:
+                epoch_sums[key] += float(metrics_with_loss.get(key, 0.0))
+            epoch_count += 1
+
             if args.local_rank == 0:
-                logger.writer.add_scalar("live_loss", loss.item(), global_batch_num)
+                logger.writer.add_scalar("live_loss", loss_value, global_batch_num)
             global_batch_num += 1
 
             scaler.scale(loss).backward()
@@ -397,6 +412,26 @@ def main(args):
             if total_steps >= args.num_steps:
                 should_keep_training = False
                 break
+
+        if args.local_rank == 0 and epoch_count > 0:
+            epoch_record = {
+                'epoch': epoch + 1,
+                'start_step': epoch_start_step,
+                'end_step': total_steps,
+                'num_updates': epoch_count,
+                'lr': scheduler.get_last_lr()[0],
+            }
+            for key in epoch_metric_keys:
+                epoch_record[key] = epoch_sums[key] / epoch_count
+            with open(epoch_metrics_path, 'a', encoding='utf-8') as f:
+                f.write(json.dumps(epoch_record, ensure_ascii=False) + '\n')
+            csv_exists = epoch_metrics_csv_path.exists()
+            with open(epoch_metrics_csv_path, 'a', newline='', encoding='utf-8') as f:
+                writer = csv.DictWriter(f, fieldnames=list(epoch_record.keys()))
+                if not csv_exists:
+                    writer.writeheader()
+                writer.writerow(epoch_record)
+            logging.info(f"Epoch Metrics ({epoch + 1}): {epoch_record}")
 
         if args.lr_scheduler_type == 'MultiStepLR':
             scheduler.step()
@@ -437,4 +472,5 @@ if __name__ == '__main__':
     torch.backends.cudnn.benchmark = True
 
     main(args)
+
 
