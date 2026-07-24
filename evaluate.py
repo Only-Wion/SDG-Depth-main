@@ -62,10 +62,10 @@ def validate(model, args, mixed_prec=False, completion_split='val'):
         image1 = image1[None].cuda()
         image2 = image2[None].cuda()
 
-        if not image1.shape[-1] in [960]:
-            pad_size = 64
-        else:
+        if args.test_datasets == 'luna' or image1.shape[-1] == 960:
             pad_size = 128
+        else:
+            pad_size = 64
         padder = InputPadder(image1.shape, divis_by=pad_size)
         image1, image2 = padder.pad(image1, image2)
         hint = padder.pad(hint)[0]
