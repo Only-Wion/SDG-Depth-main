@@ -116,6 +116,17 @@ class LunaOrganized(data.Dataset):
             lidar_times = self._read_lidar_timestamps(
                 lidar_root / timestamp_name
             ) if lidar_dir.exists() else []
+            existing_lidar_times = [
+                item for item in lidar_times
+                if (lidar_root / item[1]).exists()
+            ]
+            missing_lidar_files = len(lidar_times) - len(existing_lidar_times)
+            if missing_lidar_files:
+                logging.warning(
+                    f'Ignoring {missing_lidar_files} {self.lidar_source} timestamp '
+                    f'entries without files in {seq.name}'
+                )
+            lidar_times = existing_lidar_times
             lidar_ns = [item[0] for item in lidar_times]
 
             common = sorted(
