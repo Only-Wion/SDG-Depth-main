@@ -43,7 +43,17 @@ def find_calibration(root):
         except (OSError, json.JSONDecodeError):
             continue
         if find_key(data, "LiDAR_to_Cam_L") is not None:
-            return path, data
+            combined = {path.stem: data}
+            for sibling in path.parent.glob("*.json"):
+                if sibling == path:
+                    continue
+                try:
+                    combined[sibling.stem] = json.loads(
+                        sibling.read_text(encoding="utf-8")
+                    )
+                except (OSError, json.JSONDecodeError):
+                    continue
+            return path.parent, combined
     raise FileNotFoundError(f"No LiDAR-to-camera calibration found under {root}")
 
 
