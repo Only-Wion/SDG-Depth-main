@@ -10,7 +10,8 @@ Batch mode discovers organized sequences below --input-root, reuses one
 rectification map per sequence, writes images_rectified/ beside images/, and
 remaps aligned uint16 depth_gt/ into depth_gt_rectified/ with nearest neighbors.
 If a sequence manifest says its RGB images are already undistorted, auto mode
-uses zero distortion coefficients to avoid applying lens correction twice.
+uses zero distortion coefficients to avoid applying lens correction twice. Auto
+rectification prefers the explicit Cam_*_Rect matrices published with a sequence.
 
 An optional empirical vertical refinement is enabled by default. Batch mode
 estimates one fixed smooth y correction per sequence; x coordinates and
@@ -81,6 +82,20 @@ def parse_args() -> argparse.Namespace:
         choices=("auto", "calibrated", "already-undistorted"),
         default="auto",
         help="Auto reads each sequence manifest; organized Luna images are undistorted.",
+    )
+    parser.add_argument(
+        "--rectification-mode",
+        choices=("auto", "opencv", "calibrated"),
+        default="auto",
+        help="Auto prefers explicit Cam_*_Rect calibration when available.",
+    )
+    parser.add_argument("--left-rectified-key", default="Cam_Rect_L")
+    parser.add_argument("--right-rectified-key", default="Cam_Rect_R")
+    parser.add_argument(
+        "--left-rectification-key", default="Cam_L_to_Cam_L_Rect"
+    )
+    parser.add_argument(
+        "--right-rectification-key", default="Cam_R_to_Cam_R_Rect"
     )
     parser.add_argument(
         "--resume",
@@ -470,6 +485,7 @@ class RectificationContext:
     map_right_y: np.ndarray
     baseline: float
     zero_distortion: bool
+    rectification_mode: str
     vertical_coefficients: np.ndarray
     vertical_refinement_applied: bool
     feature_validation: dict
@@ -572,26 +588,81 @@ def create_rectification_context(
         extrinsics[args.extrinsic_key], args.extrinsic_direction
     )
     baseline = float(np.linalg.norm(translation_left_to_right))
-    (
-        rectification_left,
-        rectification_right,
-        projection_left,
-        projection_right,
-        q_opencv,
-        roi_left,
-        roi_right,
-    ) = cv2.stereoRectify(
-        camera_left,
-        distortion_left,
-        camera_right,
-        distortion_right,
-        image_size,
-        rotation_left_to_right,
-        translation_left_to_right,
-        flags=cv2.CALIB_ZERO_DISPARITY,
-        alpha=float(args.alpha),
-        newImageSize=image_size,
+    explicit_keys = (
+        args.left_rectified_key,
+        args.right_rectified_key,
+        args.left_rectification_key,
+        args.right_rectification_key,
     )
+    explicit_available = (
+        all(key in intrinsics for key in explicit_keys[:2])
+        and all(key in extrinsics for key in explicit_keys[2:])
+    )
+    use_explicit = args.rectification_mode == "calibrated" or (
+        args.rectification_mode == "auto" and explicit_available
+    )
+    if use_explicit and not explicit_available:
+        missing = [
+            key
+            for key in explicit_keys[:2]
+            if key not in intrinsics
+        ] + [
+            key
+            for key in explicit_keys[2:]
+            if key not in extrinsics
+        ]
+        raise KeyError("Missing explicit rectification keys: " + ", ".join(missing))
+    if use_explicit:
+        rectified_left, _ = scaled_camera_matrix(
+            intrinsics[args.left_rectified_key], image_size, True
+        )
+        rectified_right, _ = scaled_camera_matrix(
+            intrinsics[args.right_rectified_key], image_size, True
+        )
+        if not np.allclose(rectified_left, rectified_right, atol=1e-5):
+            raise ValueError(
+                "Explicit left/right rectified camera matrices must match"
+            )
+        rectification_left = np.asarray(
+            extrinsics[args.left_rectification_key]["R"], dtype=np.float64
+        )
+        rectification_right = np.asarray(
+            extrinsics[args.right_rectification_key]["R"], dtype=np.float64
+        )
+        projection_left = np.column_stack(
+            [rectified_left, np.zeros(3, dtype=np.float64)]
+        )
+        projection_right = projection_left.copy()
+        projection_right[0, 3] = -projection_left[0, 0] * baseline
+        _, _, q_opencv = canonical_positive_disparity_geometry(
+            projection_left, baseline
+        )
+        width, height = image_size
+        roi_left = (0, 0, width, height)
+        roi_right = (0, 0, width, height)
+        rectification_mode = "calibrated"
+    else:
+        (
+            rectification_left,
+            rectification_right,
+            projection_left,
+            projection_right,
+            q_opencv,
+            roi_left,
+            roi_right,
+        ) = cv2.stereoRectify(
+            camera_left,
+            distortion_left,
+            camera_right,
+            distortion_right,
+            image_size,
+            rotation_left_to_right,
+            translation_left_to_right,
+            flags=cv2.CALIB_ZERO_DISPARITY,
+            alpha=float(args.alpha),
+            newImageSize=image_size,
+        )
+        rectification_mode = "opencv"
     map_left_x, map_left_y = cv2.initUndistortRectifyMap(
         camera_left,
         distortion_left,
@@ -629,11 +700,11 @@ def create_rectification_context(
         map_right_y=map_right_y,
         baseline=baseline,
         zero_distortion=zero_distortion,
+        rectification_mode=rectification_mode,
         vertical_coefficients=np.zeros(3, dtype=np.float64),
         vertical_refinement_applied=False,
         feature_validation={},
     )
-
 
 def estimate_sequence_refinement(
     pairs: list[tuple[Path, Path]],
@@ -767,11 +838,17 @@ def batch_parameters(
         "alpha": float(args.alpha),
         "distortion_mode_requested": args.distortion_mode,
         "input_treated_as_already_undistorted": context.zero_distortion,
+        "rectification_mode_requested": args.rectification_mode,
+        "rectification_mode_used": context.rectification_mode,
         "keys": {
             "left": args.left_key,
             "right": args.right_key,
             "extrinsic": args.extrinsic_key,
             "extrinsic_direction": args.extrinsic_direction,
+            "left_rectified": args.left_rectified_key,
+            "right_rectified": args.right_rectified_key,
+            "left_rectification": args.left_rectification_key,
+            "right_rectification": args.right_rectification_key,
         },
         "baseline_in_extrinsic_units": context.baseline,
         "camera_matrix_left": serializable_matrix(context.camera_left),
@@ -815,6 +892,7 @@ def rectification_signature(parameters: dict) -> dict:
         "input_treated_as_already_undistorted": parameters[
             "input_treated_as_already_undistorted"
         ],
+        "rectification_mode_used": parameters["rectification_mode_used"],
         "keys": parameters["keys"],
         "R1": parameters["R1"],
         "R2": parameters["R2"],
@@ -1210,6 +1288,10 @@ def single_main(args: argparse.Namespace) -> int:
             "right": args.right_key,
             "extrinsic": args.extrinsic_key,
             "extrinsic_direction": args.extrinsic_direction,
+            "left_rectified": args.left_rectified_key,
+            "right_rectified": args.right_rectified_key,
+            "left_rectification": args.left_rectification_key,
+            "right_rectification": args.right_rectification_key,
         },
         "image_size_width_height": [width, height],
         "alpha": float(args.alpha),
