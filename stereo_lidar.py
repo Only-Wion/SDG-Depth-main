@@ -64,6 +64,8 @@ parser.add_argument('--luna_depth_subdir', default='depth_gt', type=str,
 parser.add_argument('--luna_lidar_source', default='raw', choices=['raw', 'fastlio'],
                     help='Luna sparse hint source')
 parser.add_argument('--luna_resize', type=int, nargs='*', default=[768, 1024], help='resize Luna images/depth to H W; pass no values to keep original size')
+parser.add_argument('--luna_border_crop_fraction', default=0.0, type=float,
+                    help='fraction cropped from each border after resize and LiDAR projection')
 parser.add_argument('--luna_depth_scale', default=1.0 / 256.0, type=float, help='scale from uint16 depth PNG value to meters')
 parser.add_argument('--luna_val_fraction', default=0.2, type=float, help='deterministic validation fraction for Luna data')
 parser.add_argument('--luna_test_fraction', default=None, type=float, help='deterministic test fraction for Luna data; defaults to luna_val_fraction')

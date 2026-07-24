@@ -19,7 +19,7 @@ class LunaOrganized(data.Dataset):
     """Dataset adapter for luna.organized_sequence stereo data.
 
     The adapter reads left/right RGB images and dense uint16 depth PNGs, then
-    projects the nearest raw LiDAR PCD frame into the left image to build sparse
+    projects the selected LiDAR source into the left image to build sparse
     guided disparity hints.
     """
 
@@ -50,6 +50,13 @@ class LunaOrganized(data.Dataset):
         self.lidar_source = getattr(args, 'luna_lidar_source', 'raw')
         if self.lidar_source not in {'raw', 'fastlio'}:
             raise ValueError(f'Unsupported Luna LiDAR source: {self.lidar_source}')
+        self.border_crop_fraction = float(
+            getattr(args, 'luna_border_crop_fraction', 0.0)
+        )
+        if not 0.0 <= self.border_crop_fraction < 0.5:
+            raise ValueError(
+                'luna_border_crop_fraction must satisfy 0 <= fraction < 0.5'
+            )
 
         self.image_list = []
         self.disparity_list = []
@@ -82,7 +89,7 @@ class LunaOrganized(data.Dataset):
             logging.info(f'Excluding Luna sequences: {sorted(excluded_sequences)}')
         logging.info(
             f'Luna inputs: images={self.image_subdir}, depth={self.depth_subdir}, '
-            f'lidar={self.lidar_source}'
+            f'lidar={self.lidar_source}, border_crop={self.border_crop_fraction:.1%}'
         )
         for seq in sorted([p for p in self.root.iterdir() if p.is_dir()]):
             if seq.name in excluded_sequences:
@@ -424,6 +431,19 @@ class LunaOrganized(data.Dataset):
         if self.args.guided_flag:
             disp_hints, _ = self._project_lidar_hint(sample, original_hw, target_hw, conversion_rate)
             flow_hints = np.stack([disp_hints, np.zeros_like(disp_hints)], axis=-1)
+
+        if self.border_crop_fraction > 0:
+            height, width = flow.shape[:2]
+            crop_y = int(round(height * self.border_crop_fraction))
+            crop_x = int(round(width * self.border_crop_fraction))
+            y_slice = slice(crop_y, height - crop_y)
+            x_slice = slice(crop_x, width - crop_x)
+            img1 = img1[y_slice, x_slice]
+            img2 = img2[y_slice, x_slice]
+            flow = flow[y_slice, x_slice]
+            valid = valid[y_slice, x_slice]
+            if self.args.guided_flag:
+                flow_hints = flow_hints[y_slice, x_slice]
 
         if self.augmentor is not None:
             if self.args.guided_flag:
