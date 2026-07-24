@@ -266,6 +266,7 @@ def main(args):
 
     start_epoch = 0
     start_step = 0
+    best_val_rmse = float('inf')
 
     if args.resume_ckpt is not None and args.local_rank == 0:
         assert os.path.isfile(args.resume_ckpt)
@@ -273,6 +274,13 @@ def main(args):
         loc = 'cuda:{}'.format(args.local_rank) if torch.cuda.is_available() else 'cpu'
         checkpoint = torch.load(args.resume_ckpt, map_location=loc)
         model_without_ddp.load_state_dict(checkpoint['model'], strict=args.strict_resume)
+        resume_val_metrics = checkpoint.get('val_metrics', {})
+        if 'rmse' in resume_val_metrics:
+            best_val_rmse = float(resume_val_metrics['rmse'])
+            best_path = Path(args.checkpoint_dir) / 'ckpt_best.pth'
+            if not best_path.exists():
+                torch.save(checkpoint, best_path)
+            logging.info(f"Using resumed validation RMSE as best baseline: {best_val_rmse}")
         del checkpoint
 
     milestones = [int(milestone) for milestone in args.milestones.split(',')]
@@ -293,8 +301,6 @@ def main(args):
     epoch_metric_keys = ['loss', 'epe', '1px', '3px', '5px', 'mae', 'rmse', 'imae', 'irmse']
     epoch_metrics_path = Path(args.checkpoint_dir) / 'epoch_metrics.jsonl'
     epoch_metrics_csv_path = Path(args.checkpoint_dir) / 'epoch_metrics.csv'
-
-    best_val_rmse = float('inf')
     if args.local_rank == 0 and args.first_test:
         if args.resume_ckpt is not None:
             validate(model.module, args=args, completion_split=args.first_test_type)
