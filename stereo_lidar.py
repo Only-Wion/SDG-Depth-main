@@ -16,6 +16,7 @@ from torch.utils.tensorboard import SummaryWriter
 import torch.optim as optim
 
 from core.sdg_depth.net import SDGDepth
+from core.utils.depth_mask import depth_percentile_mask
 from evaluate import validate
 import core.datasets as datasets
 
@@ -126,8 +127,17 @@ parser.add_argument('--first_test', default=0, type=int)
 parser.add_argument('--first_test_type', default='test', type=str)
 parser.add_argument('--eval_depth_range_min', default=0, type=float)
 parser.add_argument('--eval_depth_range_max', default=100., type=float)
+parser.add_argument('--depth_percentile_low', default=0.05, type=float,
+                    help='per-sample lower depth quantile used by training and evaluation')
+parser.add_argument('--depth_percentile_high', default=0.95, type=float,
+                    help='per-sample upper depth quantile used by training and evaluation')
 
 args = parser.parse_args()
+if not 0.0 <= args.depth_percentile_low < args.depth_percentile_high <= 1.0:
+    parser.error(
+        '--depth_percentile_low and --depth_percentile_high must satisfy '
+        '0 <= low < high <= 1'
+    )
 
 
 def iMAE_metric(D_est, D_gt, mask, conversion_rate, depth_est=None):
@@ -322,26 +332,45 @@ def main(args):
                 image1, image2, flow, valid, hint, conversion_rate = [x.cuda(non_blocking=True) for x in data_blob]
 
             flow = flow.squeeze(1)  # [b,h,w]
-            mask = (flow < args.max_disp) & (valid > 0)  # [b,h,w]
+            conversion_rate_map = conversion_rate[:, None, None].expand_as(flow)
+            base_mask = (
+                (flow > 0)
+                & (flow < args.max_disp)
+                & (valid > 0)
+                & torch.isfinite(flow)
+            )
+            depth_gt_full = torch.zeros_like(flow)
+            depth_gt_full[base_mask] = (
+                conversion_rate_map[base_mask] / flow[base_mask]
+            )
+            mask = depth_percentile_mask(
+                depth_gt_full,
+                base_mask,
+                args.depth_percentile_low,
+                args.depth_percentile_high,
+            )
+            if not torch.any(mask):
+                logging.warning(
+                    f'{total_steps} step has no depth pixels inside the '
+                    'configured percentile interval; skipping...'
+                )
+                continue
 
-            mask.detach()
+            hint = hint * mask.unsqueeze(1).to(hint.dtype)
             sparse_mask = (hint > 0).int()
             pred_hint, dense_confidence_out, pred_rgb_hint, pred_d_hint, stereo_disp_list, fusion_disp_list, depth = \
                 model(image1, image2, sparse=hint, sparse_mask=sparse_mask, conversion_rate=conversion_rate)
-            mask_tmp = (flow < args.max_disp) & (flow > 0)
-            loss1 = seq_loss(stereo_disp_list, flow, mask_tmp)
+            loss1 = seq_loss(stereo_disp_list, flow, mask)
 
             loss2 = args.pred_hint_weight * F.smooth_l1_loss((pred_hint[-1].squeeze(1))[mask],
                                                              flow[mask],
                                                              size_average=True)
             loss = loss1 + loss2
-            mask_tmp = (flow < args.max_disp) & (valid > 0)
-            c_rate = conversion_rate.unsqueeze(1).unsqueeze(1).repeat(1, flow.shape[-2], flow.shape[-1])
-            D_gt = c_rate[mask_tmp] / flow[mask_tmp]
+            D_gt = depth_gt_full[mask]
 
-            loss3 = args.disp_to_depth_convert_loss_weight1 * F.smooth_l1_loss(depth[mask_tmp], D_gt,
+            loss3 = args.disp_to_depth_convert_loss_weight1 * F.smooth_l1_loss(depth[mask], D_gt,
                                                                                size_average=True) + \
-                    args.disp_to_depth_convert_loss_weight2 * F.mse_loss(depth[mask_tmp], D_gt,
+                    args.disp_to_depth_convert_loss_weight2 * F.mse_loss(depth[mask], D_gt,
                                                                          size_average=True)
             loss = loss + loss3
 

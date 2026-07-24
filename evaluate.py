@@ -7,6 +7,7 @@ import torch.nn.functional as F
 from tqdm import tqdm
 
 import core.datasets as datasets
+from core.utils.depth_mask import depth_percentile_mask
 from core.utils.utils import InputPadder
 
 sys.path.append('core')
@@ -97,25 +98,43 @@ def validate(model, args, mixed_prec=False, completion_split='val'):
         assert flow_pr.shape == flow_gt.shape, (flow_pr.shape, flow_gt.shape)
     
         c_rate = conversion_rate
-        conversion_rate = conversion_rate.unsqueeze(1).unsqueeze(1).repeat(1, flow_pr.shape[-2],
-                                                                           flow_pr.shape[-1])
+        conversion_rate = conversion_rate.unsqueeze(1).unsqueeze(1).repeat(
+            1, flow_pr.shape[-2], flow_pr.shape[-1]
+        )
+        gt_positive = (flow_gt > 0) & torch.isfinite(flow_gt)
+        depth_gt_full = torch.zeros_like(flow_gt)
+        depth_gt_full[gt_positive] = (
+            conversion_rate[gt_positive] / flow_gt[gt_positive]
+        )
         if args.test_datasets == 'luna':
-            depth_gt_full = conversion_rate / torch.clamp(flow_gt, min=1e-6)
-            valid_tmp = (valid_gt.unsqueeze(0).bool()) & (flow_gt > 0) & (depth_pr > 0) & torch.isfinite(depth_pr)
-            if depth_range_min > 0:
-                valid_tmp = valid_tmp & (depth_gt_full >= depth_range_min)
-            if depth_range_max > 0:
-                valid_tmp = valid_tmp & (depth_gt_full <= depth_range_max)
-            depth_est = depth_pr[valid_tmp]
-            depth_gt = depth_gt_full[valid_tmp]
+            valid_tmp = (
+                valid_gt.unsqueeze(0).bool()
+                & gt_positive
+                & (depth_pr > 0)
+                & torch.isfinite(depth_pr)
+            )
         else:
-            valid_tmp = (valid_gt.unsqueeze(0).bool()) & (
-                    flow_gt > (c_rate / 100.)) & (
-                                flow_gt < args.max_disp) & (flow_gt < (c_rate / depth_range_min)) & (
-                                flow_gt > (c_rate / depth_range_max)) & (flow_pr > 0) & (flow_pr > (c_rate / 100.))
-            valid_tmp = valid_tmp & (depth_pr > 0)
-            depth_est = depth_pr[valid_tmp]
-            depth_gt = conversion_rate[valid_tmp] / flow_gt[valid_tmp]
+            valid_tmp = (
+                valid_gt.unsqueeze(0).bool()
+                & gt_positive
+                & (flow_gt < args.max_disp)
+                & (flow_pr > 0)
+                & (flow_pr > (c_rate / 100.))
+                & (depth_pr > 0)
+                & torch.isfinite(depth_pr)
+            )
+        if depth_range_min > 0:
+            valid_tmp = valid_tmp & (depth_gt_full >= depth_range_min)
+        if depth_range_max > 0:
+            valid_tmp = valid_tmp & (depth_gt_full <= depth_range_max)
+        valid_tmp = depth_percentile_mask(
+            depth_gt_full,
+            valid_tmp,
+            getattr(args, 'depth_percentile_low', 0.05),
+            getattr(args, 'depth_percentile_high', 0.95),
+        )
+        depth_est = depth_pr[valid_tmp]
+        depth_gt = depth_gt_full[valid_tmp]
         if depth_est.numel() == 0:
             continue
         mae = torch.abs(depth_gt - depth_est).mean()
