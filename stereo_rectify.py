@@ -340,6 +340,27 @@ def vertical_statistics(
     }
 
 
+def vertical_model_basis(x: np.ndarray, y: np.ndarray) -> np.ndarray:
+    return np.stack(
+        [np.ones_like(x), x, y, x * x, x * y, y * y], axis=-1
+    ).astype(np.float64)
+
+
+def vertical_model_delta(
+    x: np.ndarray,
+    y: np.ndarray,
+    coefficients: np.ndarray,
+) -> np.ndarray:
+    return (
+        coefficients[0]
+        + coefficients[1] * x
+        + coefficients[2] * y
+        + coefficients[3] * x * x
+        + coefficients[4] * x * y
+        + coefficients[5] * y * y
+    )
+
+
 def robust_vertical_model(
     right_rectified_points: np.ndarray,
     target_delta_y: np.ndarray,
@@ -348,10 +369,10 @@ def robust_vertical_model(
     width, height = image_size
     x = right_rectified_points[:, 0] / max(1, width - 1) * 2.0 - 1.0
     y = right_rectified_points[:, 1] / max(1, height - 1) * 2.0 - 1.0
-    basis = np.stack([np.ones_like(x), x, y], axis=1).astype(np.float64)
+    basis = vertical_model_basis(x, y)
     target = target_delta_y.astype(np.float64)
     weights = np.ones(len(target))
-    coefficients = np.zeros(3)
+    coefficients = np.zeros(6)
     for _ in range(10):
         weighted = np.sqrt(weights)[:, None]
         coefficients, *_ = np.linalg.lstsq(
@@ -372,23 +393,23 @@ def refine_right_vertical(
     coefficients: np.ndarray,
 ) -> np.ndarray:
     height, width = right_rectified.shape[:2]
-    coefficient_0, coefficient_x, coefficient_y = coefficients
     x_pixels = np.arange(width, dtype=np.float32)[None, :]
     y_pixels = np.arange(height, dtype=np.float32)[:, None]
     x_normalized = x_pixels / max(1, width - 1) * 2.0 - 1.0
-    denominator = 1.0 + 2.0 * coefficient_y / max(1, height - 1)
-    source_y = (
-        y_pixels
-        - coefficient_0
-        - coefficient_x * x_normalized
-        + coefficient_y
-    ) / denominator
+    source_y = np.broadcast_to(y_pixels, (height, width)).astype(np.float32).copy()
+    for _ in range(6):
+        y_normalized = source_y / max(1, height - 1) * 2.0 - 1.0
+        delta = vertical_model_delta(
+            np.broadcast_to(x_normalized, source_y.shape),
+            y_normalized,
+            coefficients,
+        )
+        source_y = (y_pixels - delta).astype(np.float32)
     map_x = np.broadcast_to(x_pixels, (height, width)).astype(np.float32)
-    map_y = np.broadcast_to(source_y, (height, width)).astype(np.float32)
     return cv2.remap(
         right_rectified,
         map_x,
-        map_y,
+        source_y,
         interpolation=cv2.INTER_LINEAR,
         borderMode=cv2.BORDER_CONSTANT,
     )
@@ -402,11 +423,10 @@ def refined_point_coordinates(
     width, height = image_size
     x = right_points[:, 0] / max(1, width - 1) * 2.0 - 1.0
     y = right_points[:, 1] / max(1, height - 1) * 2.0 - 1.0
-    delta = coefficients[0] + coefficients[1] * x + coefficients[2] * y
+    delta = vertical_model_delta(x, y, coefficients)
     refined = right_points.copy()
     refined[:, 1] += delta
     return refined
-
 
 def canonical_positive_disparity_geometry(
     projection_left: np.ndarray,
@@ -701,7 +721,7 @@ def create_rectification_context(
         baseline=baseline,
         zero_distortion=zero_distortion,
         rectification_mode=rectification_mode,
-        vertical_coefficients=np.zeros(3, dtype=np.float64),
+        vertical_coefficients=np.zeros(6, dtype=np.float64),
         vertical_refinement_applied=False,
         feature_validation={},
     )
@@ -879,8 +899,8 @@ def batch_parameters(
             "applied": context.vertical_refinement_applied,
             "minimum_p90_improvement_px": 0.01,
             "scope": "one fixed model per sequence",
-            "model": "delta_y = c0 + cx*x_normalized + cy*y_normalized",
-            "coefficients_c0_cx_cy": context.vertical_coefficients.tolist(),
+            "model": "quadratic y-only surface over normalized x,y",
+            "coefficients_1_x_y_x2_xy_y2": context.vertical_coefficients.tolist(),
         },
     }
 
@@ -1236,7 +1256,7 @@ def single_main(args: argparse.Namespace) -> int:
         right_points_rectified,
     )
 
-    vertical_coefficients = np.zeros(3, dtype=np.float64)
+    vertical_coefficients = np.zeros(6, dtype=np.float64)
     if not args.no_refine_vertical:
         vertical_coefficients = robust_vertical_model(
             right_points_rectified,
@@ -1320,8 +1340,8 @@ def single_main(args: argparse.Namespace) -> int:
         },
         "vertical_refinement": {
             "enabled": not args.no_refine_vertical,
-            "model": "delta_y = c0 + cx*x_normalized + cy*y_normalized",
-            "coefficients_c0_cx_cy": vertical_coefficients.tolist(),
+            "model": "quadratic y-only surface over normalized x,y",
+            "coefficients_1_x_y_x2_xy_y2": vertical_coefficients.tolist(),
             "note": (
                 "This refinement changes only right-image y coordinates. "
                 "Horizontal disparity x_left-x_right is unchanged."
