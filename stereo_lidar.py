@@ -57,6 +57,12 @@ parser.add_argument('--test_datasets', default='kitti_completion', type=str)
 parser.add_argument('--luna_root', default='D:/batch_organized', type=str, help='root directory for luna organized data')
 parser.add_argument('--luna_exclude_sequences', nargs='*', default=[],
                     help='Luna sequence directory names to exclude before train/val/test splitting')
+parser.add_argument('--luna_image_subdir', default='images', type=str,
+                    help='per-sequence directory containing left/right Luna images')
+parser.add_argument('--luna_depth_subdir', default='depth_gt', type=str,
+                    help='per-sequence directory containing Luna depth PNGs')
+parser.add_argument('--luna_lidar_source', default='raw', choices=['raw', 'fastlio'],
+                    help='Luna sparse hint source')
 parser.add_argument('--luna_resize', type=int, nargs='*', default=[768, 1024], help='resize Luna images/depth to H W; pass no values to keep original size')
 parser.add_argument('--luna_depth_scale', default=1.0 / 256.0, type=float, help='scale from uint16 depth PNG value to meters')
 parser.add_argument('--luna_val_fraction', default=0.2, type=float, help='deterministic validation fraction for Luna data')

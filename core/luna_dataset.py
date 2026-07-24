@@ -10,6 +10,7 @@ import torch.nn.functional as F
 import torch.utils.data as data
 from loguru import logger as logging
 from PIL import Image
+from scipy.spatial.transform import Rotation, Slerp
 
 from core.utils.augmentor import FlowAugmentor, SparseFlowAugmentor
 
@@ -44,6 +45,11 @@ class LunaOrganized(data.Dataset):
         self.require_lidar = bool(getattr(args, 'luna_require_lidar', 1))
         self.camera_key = getattr(args, 'luna_camera_key', 'Cam_Rect_L')
         self.apply_rectification = bool(getattr(args, 'luna_apply_rectification', 1))
+        self.image_subdir = Path(getattr(args, 'luna_image_subdir', 'images'))
+        self.depth_subdir = Path(getattr(args, 'luna_depth_subdir', 'depth_gt'))
+        self.lidar_source = getattr(args, 'luna_lidar_source', 'raw')
+        if self.lidar_source not in {'raw', 'fastlio'}:
+            raise ValueError(f'Unsupported Luna LiDAR source: {self.lidar_source}')
 
         self.image_list = []
         self.disparity_list = []
@@ -74,25 +80,42 @@ class LunaOrganized(data.Dataset):
         excluded_sequences = set(getattr(self.args, 'luna_exclude_sequences', []) or [])
         if excluded_sequences:
             logging.info(f'Excluding Luna sequences: {sorted(excluded_sequences)}')
+        logging.info(
+            f'Luna inputs: images={self.image_subdir}, depth={self.depth_subdir}, '
+            f'lidar={self.lidar_source}'
+        )
         for seq in sorted([p for p in self.root.iterdir() if p.is_dir()]):
             if seq.name in excluded_sequences:
                 continue
             if not (seq / 'manifest.json').exists() and not (seq / 'calibration').exists():
                 continue
-            left_dir = seq / 'images' / 'left'
-            right_dir = seq / 'images' / 'right'
-            depth_dir = seq / 'depth_gt'
-            lidar_dir = seq / 'lidar_raw' / 'frames'
+            left_dir = seq / self.image_subdir / 'left'
+            right_dir = seq / self.image_subdir / 'right'
+            depth_dir = seq / self.depth_subdir
+            lidar_root = seq / f'lidar_{self.lidar_source}'
+            lidar_dir = lidar_root / 'frames'
             if not left_dir.exists() or not right_dir.exists() or not depth_dir.exists():
                 logging.warning(f'Skipping {seq.name}: missing stereo image or depth directory')
                 continue
             if self.require_lidar and not lidar_dir.exists():
-                logging.warning(f'Skipping {seq.name}: missing raw LiDAR directory')
+                logging.warning(
+                    f'Skipping {seq.name}: missing {self.lidar_source} LiDAR directory'
+                )
                 continue
 
             calib = self._read_calibration(seq / 'calibration')
+            if self.lidar_source == 'fastlio':
+                calib['trajectory'] = self._read_fastlio_trajectory(
+                    lidar_root / 'trajectory.npz'
+                )
             image_times = self._read_image_timestamps(seq / 'images' / 'timestamps.tsv')
-            lidar_times = self._read_lidar_timestamps(seq / 'lidar_raw' / 'timestamps.txt') if lidar_dir.exists() else []
+            timestamp_name = (
+                'timestamps.tsv' if self.lidar_source == 'fastlio'
+                else 'timestamps.txt'
+            )
+            lidar_times = self._read_lidar_timestamps(
+                lidar_root / timestamp_name
+            ) if lidar_dir.exists() else []
             lidar_ns = [item[0] for item in lidar_times]
 
             common = sorted(
@@ -105,7 +128,9 @@ class LunaOrganized(data.Dataset):
                 lidar_path = None
                 image_ns = image_times.get(('left', stem))
                 if lidar_times and image_ns is not None:
-                    lidar_path = self._nearest_lidar(seq, image_ns, lidar_ns, lidar_times)
+                    lidar_path = self._nearest_lidar(
+                        lidar_root, image_ns, lidar_ns, lidar_times
+                    )
                 if self.require_lidar and lidar_path is None:
                     skipped_no_lidar += 1
                     continue
@@ -117,10 +142,14 @@ class LunaOrganized(data.Dataset):
                     'depth': depth_dir / f'{stem}.png',
                     'lidar': lidar_path,
                     'calib': calib,
+                    'image_time_ns': image_ns,
                 })
 
         if skipped_no_lidar:
-            logging.warning(f'Skipped {skipped_no_lidar} Luna samples without a matched raw LiDAR frame')
+            logging.warning(
+                f'Skipped {skipped_no_lidar} Luna samples without a matched '
+                f'{self.lidar_source} LiDAR frame'
+            )
 
         if image_set in ['training', 'val', 'test']:
             return self._split_samples(all_samples, image_set=image_set)
@@ -197,7 +226,7 @@ class LunaOrganized(data.Dataset):
                     result.append((int(parts[2]), parts[1]))
         return sorted(result)
 
-    def _nearest_lidar(self, seq, image_ns, lidar_ns, lidar_times):
+    def _nearest_lidar(self, lidar_root, image_ns, lidar_ns, lidar_times):
         pos = np.searchsorted(lidar_ns, image_ns)
         candidates = []
         if pos < len(lidar_times):
@@ -209,7 +238,48 @@ class LunaOrganized(data.Dataset):
         best_ns, rel_path = min(candidates, key=lambda item: abs(item[0] - image_ns))
         if abs(best_ns - image_ns) > self.max_time_diff_ns:
             return None
-        return seq / 'lidar_raw' / rel_path
+        return lidar_root / rel_path
+
+    def _read_fastlio_trajectory(self, path):
+        if not path.exists():
+            raise FileNotFoundError(f'Missing FAST-LIO trajectory: {path}')
+        with np.load(path) as trajectory:
+            times = trajectory['header_time_ns'].astype(np.int64)
+            order = np.argsort(times)
+            return {
+                'header_time_ns': times[order],
+                'position': trajectory['position'][order].astype(np.float64),
+                'orientation': trajectory['orientation'][order].astype(np.float64),
+            }
+
+    def _interpolate_fastlio_pose(self, trajectory, timestamp_ns):
+        times = trajectory['header_time_ns']
+        positions = trajectory['position']
+        quaternions = trajectory['orientation']
+        relative_times = (times - times[0]) * 1e-9
+        query_time = float(
+            np.clip(
+                (timestamp_ns - times[0]) * 1e-9,
+                relative_times[0],
+                relative_times[-1],
+            )
+        )
+        upper = int(np.searchsorted(relative_times, query_time))
+        if upper == 0:
+            return positions[0], Rotation.from_quat(quaternions[0]).as_matrix()
+        if upper == len(relative_times):
+            return positions[-1], Rotation.from_quat(quaternions[-1]).as_matrix()
+
+        lower = upper - 1
+        alpha = (query_time - relative_times[lower]) / (
+            relative_times[upper] - relative_times[lower]
+        )
+        position = (1.0 - alpha) * positions[lower] + alpha * positions[upper]
+        rotation = Slerp(
+            relative_times[[lower, upper]],
+            Rotation.from_quat(quaternions[[lower, upper]]),
+        )([query_time]).as_matrix()[0]
+        return position, rotation
 
     def _read_pcd_xyz(self, filename):
         fields, sizes, types, counts = None, None, None, None
@@ -256,6 +326,18 @@ class LunaOrganized(data.Dataset):
             pcd = np.fromfile(f, dtype=np.dtype(dtype_fields), count=points)
         return np.stack([pcd['x'], pcd['y'], pcd['z']], axis=1).astype(np.float32)
 
+    def _read_lidar_xyz(self, sample):
+        if self.lidar_source == 'raw':
+            return self._read_pcd_xyz(sample['lidar'])
+
+        with np.load(sample['lidar']) as cloud:
+            map_points = cloud['xyz'].astype(np.float64)
+        position, map_from_body = self._interpolate_fastlio_pose(
+            sample['calib']['trajectory'],
+            sample['image_time_ns'],
+        )
+        return ((map_points - position) @ map_from_body).astype(np.float32)
+
     def _load_depth_m(self, filename):
         return np.array(Image.open(filename), dtype=np.float32) * self.depth_scale
 
@@ -263,7 +345,7 @@ class LunaOrganized(data.Dataset):
         if sample['lidar'] is None:
             return np.zeros(target_hw, dtype=np.float32), np.zeros(target_hw, dtype=bool)
 
-        pts = self._read_pcd_xyz(sample['lidar'])
+        pts = self._read_lidar_xyz(sample)
         ones = np.ones((pts.shape[0], 1), dtype=np.float32)
         pts_cam = (sample['calib']['lidar_to_cam'] @ np.concatenate([pts, ones], axis=1).T).T[:, :3]
         pts_rect = (sample['calib']['rect_r'] @ pts_cam.T).T
