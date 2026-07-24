@@ -6,14 +6,21 @@ The default extrinsic key is Cam_R_to_Cam_L. OpenCV stereoRectify expects
 the transform from the first camera (left) to the second camera (right), so
 the script inverts R_right_to_left and T_right_to_left before rectification.
 
-An optional empirical vertical refinement is enabled by default. It estimates
-only a smooth y correction for the right rectified image; x coordinates and
+Batch mode discovers organized sequences below --input-root, reuses one
+rectification map per sequence, writes images_rectified/ beside images/, and
+remaps aligned uint16 depth_gt/ into depth_gt_rectified/ with nearest neighbors.
+If a sequence manifest says its RGB images are already undistorted, auto mode
+uses zero distortion coefficients to avoid applying lens correction twice.
+
+An optional empirical vertical refinement is enabled by default. Batch mode
+estimates one fixed smooth y correction per sequence; x coordinates and
 therefore horizontal disparity are left unchanged.
 """
 
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 import json
 import os
 import sys
@@ -27,11 +34,12 @@ def parse_args() -> argparse.Namespace:
     script_dir = Path(__file__).resolve().parent
     parser = argparse.ArgumentParser(
         description=(
-            "Undistort and epipolar-rectify a calibrated stereo image pair."
+            "Rectify one calibrated stereo pair or a root of organized sequences."
         )
     )
-    parser.add_argument("--left", type=Path, required=True, help="Left image.")
-    parser.add_argument("--right", type=Path, required=True, help="Right image.")
+    parser.add_argument("--left", type=Path, help="Left image in single-pair mode.")
+    parser.add_argument("--right", type=Path, help="Right image in single-pair mode.")
+    parser.add_argument("--input-root", type=Path, help="Root of organized sequences.")
     parser.add_argument(
         "--intrinsics",
         type=Path,
@@ -46,6 +54,38 @@ def parse_args() -> argparse.Namespace:
         "--output-dir",
         type=Path,
         default=script_dir / "rectified_output",
+    )
+    parser.add_argument(
+        "--output-subdir",
+        default="images_rectified",
+        help="Per-sequence output directory name in batch mode.",
+    )
+    parser.add_argument(
+        "--sequence",
+        action="append",
+        help="Process only this sequence name; may be repeated.",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        help="Process at most this many pairs per sequence (for validation).",
+    )
+    parser.add_argument(
+        "--refine-samples",
+        type=int,
+        default=5,
+        help="Frames sampled per sequence to estimate one fixed y refinement.",
+    )
+    parser.add_argument(
+        "--distortion-mode",
+        choices=("auto", "calibrated", "already-undistorted"),
+        default="auto",
+        help="Auto reads each sequence manifest; organized Luna images are undistorted.",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Skip pairs whose two rectified outputs already exist.",
     )
     parser.add_argument("--left-key", default="Cam_L")
     parser.add_argument("--right-key", default="Cam_R")
@@ -74,11 +114,31 @@ def parse_args() -> argparse.Namespace:
         help="Disable feature-based residual y-only refinement.",
     )
     parser.add_argument(
+        "--no-rectify-depth",
+        action="store_true",
+        help="Do not remap depth_gt with the left rectification map.",
+    )
+    parser.add_argument(
         "--overwrite",
         action="store_true",
-        help="Overwrite existing files in the output directory.",
+        help="Overwrite existing output files.",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    single_requested = args.left is not None or args.right is not None
+    if args.input_root is not None and single_requested:
+        parser.error("--input-root cannot be combined with --left or --right")
+    if args.input_root is None and (args.left is None or args.right is None):
+        parser.error("provide --input-root, or both --left and --right")
+    if args.limit is not None and args.limit <= 0:
+        parser.error("--limit must be positive")
+    if args.refine_samples <= 0:
+        parser.error("--refine-samples must be positive")
+    output_subdir = Path(args.output_subdir)
+    if output_subdir.is_absolute() or ".." in output_subdir.parts:
+        parser.error("--output-subdir must be relative and cannot contain '..'")
+    if args.resume and args.overwrite:
+        parser.error("--resume and --overwrite are mutually exclusive")
+    return args
 
 
 def load_json(path: Path) -> dict:
@@ -93,6 +153,13 @@ def read_image(path: Path) -> np.ndarray:
         raise RuntimeError(f"Cannot decode image: {path}")
     return image
 
+
+def read_image_unchanged(path: Path) -> np.ndarray:
+    encoded = np.fromfile(str(path), dtype=np.uint8)
+    image = cv2.imdecode(encoded, cv2.IMREAD_UNCHANGED)
+    if image is None:
+        raise RuntimeError(f"Cannot decode image: {path}")
+    return image
 
 def write_image(path: Path, image: np.ndarray, overwrite: bool) -> None:
     if path.exists() and not overwrite:
@@ -122,9 +189,12 @@ def write_image(path: Path, image: np.ndarray, overwrite: bool) -> None:
 def scaled_camera_matrix(
     entry: dict,
     actual_size: tuple[int, int],
+    zero_distortion: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
     matrix = np.asarray(entry["K"], dtype=np.float64).copy()
     distortion = np.asarray(entry.get("distortion", []), dtype=np.float64)
+    if zero_distortion:
+        distortion = np.zeros_like(distortion)
     calibration_height, calibration_width = entry["resolution"]
     actual_width, actual_height = actual_size
     scale_x = actual_width / float(calibration_width)
@@ -378,8 +448,606 @@ def serializable_matrix(matrix: np.ndarray) -> list:
     return np.asarray(matrix).tolist()
 
 
-def main() -> int:
-    args = parse_args()
+@dataclass
+class RectificationContext:
+    image_size: tuple[int, int]
+    camera_left: np.ndarray
+    camera_right: np.ndarray
+    distortion_left: np.ndarray
+    distortion_right: np.ndarray
+    rotation_left_to_right: np.ndarray
+    translation_left_to_right: np.ndarray
+    rectification_left: np.ndarray
+    rectification_right: np.ndarray
+    projection_left: np.ndarray
+    projection_right: np.ndarray
+    q_opencv: np.ndarray
+    roi_left: tuple[int, int, int, int]
+    roi_right: tuple[int, int, int, int]
+    map_left_x: np.ndarray
+    map_left_y: np.ndarray
+    map_right_x: np.ndarray
+    map_right_y: np.ndarray
+    baseline: float
+    zero_distortion: bool
+    vertical_coefficients: np.ndarray
+    vertical_refinement_applied: bool
+    feature_validation: dict
+
+
+def write_json(path: Path, value: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    try:
+        with temporary.open("w", encoding="utf-8") as handle:
+            json.dump(value, handle, ensure_ascii=False, indent=2)
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def discover_sequences(root: Path, selected: list[str] | None) -> list[Path]:
+    if not root.is_dir():
+        raise NotADirectoryError(f"Batch input root does not exist: {root}")
+    selected_set = set(selected or [])
+    sequences = []
+    for candidate in sorted(root.iterdir()):
+        if not candidate.is_dir():
+            continue
+        if selected_set and candidate.name not in selected_set:
+            continue
+        required = (
+            candidate / "images" / "left",
+            candidate / "images" / "right",
+            candidate / "calibration" / "intrinsics.json",
+            candidate / "calibration" / "extrinsics.json",
+        )
+        if all(path.exists() for path in required):
+            sequences.append(candidate)
+    if selected_set:
+        found = {path.name for path in sequences}
+        missing = sorted(selected_set - found)
+        if missing:
+            raise FileNotFoundError(
+                "Selected sequences are missing or incomplete: " + ", ".join(missing)
+            )
+    if not sequences:
+        raise RuntimeError(f"No organized stereo sequences found under: {root}")
+    return sequences
+
+
+def paired_image_paths(sequence_dir: Path) -> list[tuple[Path, Path]]:
+    left_dir = sequence_dir / "images" / "left"
+    right_dir = sequence_dir / "images" / "right"
+    left = {path.name: path for path in left_dir.glob("*.png")}
+    right = {path.name: path for path in right_dir.glob("*.png")}
+    missing_right = sorted(left.keys() - right.keys())
+    missing_left = sorted(right.keys() - left.keys())
+    if missing_right or missing_left:
+        details = []
+        if missing_right:
+            details.append(f"missing right: {missing_right[:5]}")
+        if missing_left:
+            details.append(f"missing left: {missing_left[:5]}")
+        raise RuntimeError(
+            f"Unpaired images in {sequence_dir.name}: " + "; ".join(details)
+        )
+    if not left:
+        raise RuntimeError(f"No PNG stereo pairs in: {sequence_dir / 'images'}")
+    return [(left[name], right[name]) for name in sorted(left)]
+
+
+def manifest_reports_undistorted(sequence_dir: Path) -> bool:
+    manifest_path = sequence_dir / "manifest.json"
+    if not manifest_path.exists():
+        return False
+    manifest = load_json(manifest_path)
+    convention = str(
+        manifest.get("coordinate_conventions", {}).get("images", "")
+    ).lower()
+    return "undistort" in convention
+
+
+def create_rectification_context(
+    sequence_dir: Path,
+    image_size: tuple[int, int],
+    args: argparse.Namespace,
+) -> RectificationContext:
+    intrinsics = load_json(sequence_dir / "calibration" / "intrinsics.json")
+    extrinsics = load_json(sequence_dir / "calibration" / "extrinsics.json")
+    if args.distortion_mode == "already-undistorted":
+        zero_distortion = True
+    elif args.distortion_mode == "calibrated":
+        zero_distortion = False
+    else:
+        zero_distortion = manifest_reports_undistorted(sequence_dir)
+    camera_left, distortion_left = scaled_camera_matrix(
+        intrinsics[args.left_key], image_size, zero_distortion
+    )
+    camera_right, distortion_right = scaled_camera_matrix(
+        intrinsics[args.right_key], image_size, zero_distortion
+    )
+    rotation_left_to_right, translation_left_to_right = left_to_right_extrinsics(
+        extrinsics[args.extrinsic_key], args.extrinsic_direction
+    )
+    baseline = float(np.linalg.norm(translation_left_to_right))
+    (
+        rectification_left,
+        rectification_right,
+        projection_left,
+        projection_right,
+        q_opencv,
+        roi_left,
+        roi_right,
+    ) = cv2.stereoRectify(
+        camera_left,
+        distortion_left,
+        camera_right,
+        distortion_right,
+        image_size,
+        rotation_left_to_right,
+        translation_left_to_right,
+        flags=cv2.CALIB_ZERO_DISPARITY,
+        alpha=float(args.alpha),
+        newImageSize=image_size,
+    )
+    map_left_x, map_left_y = cv2.initUndistortRectifyMap(
+        camera_left,
+        distortion_left,
+        rectification_left,
+        projection_left,
+        image_size,
+        cv2.CV_32FC1,
+    )
+    map_right_x, map_right_y = cv2.initUndistortRectifyMap(
+        camera_right,
+        distortion_right,
+        rectification_right,
+        projection_right,
+        image_size,
+        cv2.CV_32FC1,
+    )
+    return RectificationContext(
+        image_size=image_size,
+        camera_left=camera_left,
+        camera_right=camera_right,
+        distortion_left=distortion_left,
+        distortion_right=distortion_right,
+        rotation_left_to_right=rotation_left_to_right,
+        translation_left_to_right=translation_left_to_right,
+        rectification_left=rectification_left,
+        rectification_right=rectification_right,
+        projection_left=projection_left,
+        projection_right=projection_right,
+        q_opencv=q_opencv,
+        roi_left=tuple(map(int, roi_left)),
+        roi_right=tuple(map(int, roi_right)),
+        map_left_x=map_left_x,
+        map_left_y=map_left_y,
+        map_right_x=map_right_x,
+        map_right_y=map_right_y,
+        baseline=baseline,
+        zero_distortion=zero_distortion,
+        vertical_coefficients=np.zeros(3, dtype=np.float64),
+        vertical_refinement_applied=False,
+        feature_validation={},
+    )
+
+
+def estimate_sequence_refinement(
+    pairs: list[tuple[Path, Path]],
+    context: RectificationContext,
+    args: argparse.Namespace,
+) -> None:
+    sample_count = min(args.refine_samples, len(pairs))
+    sample_indices = sorted(
+        set(np.linspace(0, len(pairs) - 1, sample_count, dtype=int).tolist())
+    )
+    left_rectified_batches = []
+    right_rectified_batches = []
+    sample_reports = []
+    for index in sample_indices:
+        left_path, right_path = pairs[index]
+        try:
+            left_image = read_image(left_path)
+            right_image = read_image(right_path)
+            left_points, right_points, ratio_count, inlier_count = match_points(
+                left_image, right_image
+            )
+            left_rectified = transform_points(
+                left_points,
+                context.camera_left,
+                context.distortion_left,
+                context.rectification_left,
+                context.projection_left,
+            )
+            right_rectified = transform_points(
+                right_points,
+                context.camera_right,
+                context.distortion_right,
+                context.rectification_right,
+                context.projection_right,
+            )
+            left_rectified_batches.append(left_rectified)
+            right_rectified_batches.append(right_rectified)
+            sample_reports.append(
+                {
+                    "frame": left_path.name,
+                    "ratio_matches": ratio_count,
+                    "geometric_inliers": inlier_count,
+                }
+            )
+        except Exception as error:
+            sample_reports.append({"frame": left_path.name, "error": str(error)})
+    if not left_rectified_batches:
+        raise RuntimeError(
+            "Feature validation failed for every sampled pair; cannot validate "
+            "the sequence calibration"
+        )
+    left_all = np.concatenate(left_rectified_batches, axis=0)
+    right_all = np.concatenate(right_rectified_batches, axis=0)
+    before = vertical_statistics(left_all, right_all)
+    after = before
+    if not args.no_refine_vertical:
+        candidate_coefficients = robust_vertical_model(
+            right_all,
+            left_all[:, 1] - right_all[:, 1],
+            context.image_size,
+        )
+        candidate_right = refined_point_coordinates(
+            right_all, candidate_coefficients, context.image_size
+        )
+        candidate_statistics = vertical_statistics(left_all, candidate_right)
+        improvement = (
+            before["p90_abs_y_px"] - candidate_statistics["p90_abs_y_px"]
+        )
+        if improvement >= 0.01:
+            context.vertical_coefficients = candidate_coefficients
+            context.vertical_refinement_applied = True
+            after = candidate_statistics
+    context.feature_validation = {
+        "sampled_frames": sample_reports,
+        "successful_samples": len(left_rectified_batches),
+        "total_geometric_inliers": int(len(left_all)),
+        "before_vertical_refinement": before,
+        "after_vertical_refinement": after,
+    }
+
+
+def rectify_with_context(
+    left_image: np.ndarray,
+    right_image: np.ndarray,
+    context: RectificationContext,
+    refine_vertical: bool,
+) -> tuple[np.ndarray, np.ndarray]:
+    expected_width, expected_height = context.image_size
+    expected_shape = (expected_height, expected_width)
+    if left_image.shape[:2] != expected_shape or right_image.shape[:2] != expected_shape:
+        raise ValueError(
+            "Pair dimensions differ from sequence calibration context: "
+            f"expected={expected_shape}, left={left_image.shape[:2]}, "
+            f"right={right_image.shape[:2]}"
+        )
+    left_rectified = cv2.remap(
+        left_image,
+        context.map_left_x,
+        context.map_left_y,
+        interpolation=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+    )
+    right_rectified = cv2.remap(
+        right_image,
+        context.map_right_x,
+        context.map_right_y,
+        interpolation=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+    )
+    if refine_vertical:
+        right_rectified = refine_right_vertical(
+            right_rectified, context.vertical_coefficients
+        )
+    return left_rectified, right_rectified
+
+
+def batch_parameters(
+    sequence_dir: Path,
+    context: RectificationContext,
+    args: argparse.Namespace,
+) -> dict:
+    projection_left_positive, projection_right_positive, q_positive = (
+        canonical_positive_disparity_geometry(
+            context.projection_left, context.baseline
+        )
+    )
+    return {
+        "sequence": sequence_dir.name,
+        "source_sequence": str(sequence_dir),
+        "image_size_width_height": list(context.image_size),
+        "alpha": float(args.alpha),
+        "distortion_mode_requested": args.distortion_mode,
+        "input_treated_as_already_undistorted": context.zero_distortion,
+        "keys": {
+            "left": args.left_key,
+            "right": args.right_key,
+            "extrinsic": args.extrinsic_key,
+            "extrinsic_direction": args.extrinsic_direction,
+        },
+        "baseline_in_extrinsic_units": context.baseline,
+        "camera_matrix_left": serializable_matrix(context.camera_left),
+        "camera_matrix_right": serializable_matrix(context.camera_right),
+        "distortion_left_used": serializable_matrix(context.distortion_left),
+        "distortion_right_used": serializable_matrix(context.distortion_right),
+        "R_left_to_right": serializable_matrix(context.rotation_left_to_right),
+        "T_left_to_right": serializable_matrix(context.translation_left_to_right),
+        "R1": serializable_matrix(context.rectification_left),
+        "R2": serializable_matrix(context.rectification_right),
+        "P1_opencv": serializable_matrix(context.projection_left),
+        "P2_opencv": serializable_matrix(context.projection_right),
+        "Q_opencv": serializable_matrix(context.q_opencv),
+        "P1_positive_disparity": serializable_matrix(projection_left_positive),
+        "P2_positive_disparity": serializable_matrix(projection_right_positive),
+        "Q_positive_disparity": serializable_matrix(q_positive),
+        "valid_roi_left": list(context.roi_left),
+        "valid_roi_right": list(context.roi_right),
+        "feature_validation": context.feature_validation,
+        "depth_rectification": {
+            "requested": not args.no_rectify_depth,
+            "interpolation": "nearest",
+            "map": "left rectification map",
+            "invalid_value": 0,
+        },
+        "vertical_refinement": {
+            "requested": not args.no_refine_vertical,
+            "applied": context.vertical_refinement_applied,
+            "minimum_p90_improvement_px": 0.01,
+            "scope": "one fixed model per sequence",
+            "model": "delta_y = c0 + cx*x_normalized + cy*y_normalized",
+            "coefficients_c0_cx_cy": context.vertical_coefficients.tolist(),
+        },
+    }
+
+
+def rectification_signature(parameters: dict) -> dict:
+    return {
+        "image_size_width_height": parameters["image_size_width_height"],
+        "alpha": parameters["alpha"],
+        "input_treated_as_already_undistorted": parameters[
+            "input_treated_as_already_undistorted"
+        ],
+        "keys": parameters["keys"],
+        "R1": parameters["R1"],
+        "R2": parameters["R2"],
+        "P1_opencv": parameters["P1_opencv"],
+        "P2_opencv": parameters["P2_opencv"],
+        "depth_rectification": parameters["depth_rectification"],
+        "vertical_refinement": parameters["vertical_refinement"],
+    }
+
+
+def process_sequence_batch(
+    sequence_dir: Path,
+    args: argparse.Namespace,
+) -> dict:
+    all_pairs = paired_image_paths(sequence_dir)
+    pairs = all_pairs[: args.limit] if args.limit is not None else all_pairs
+    depth_source_dir = sequence_dir / "depth_gt"
+    rectify_depth = depth_source_dir.is_dir() and not args.no_rectify_depth
+    if rectify_depth:
+        missing_depth = [
+            left_path.name
+            for left_path, _ in pairs
+            if not (depth_source_dir / left_path.name).exists()
+        ]
+        if missing_depth:
+            raise FileNotFoundError(
+                f"Missing depth_gt files in {sequence_dir.name}: {missing_depth[:5]}"
+            )
+    first_left = read_image(pairs[0][0])
+    first_right = read_image(pairs[0][1])
+    if first_left.shape[:2] != first_right.shape[:2]:
+        raise ValueError(
+            f"First pair dimensions differ in {sequence_dir.name}: "
+            f"{first_left.shape[:2]} vs {first_right.shape[:2]}"
+        )
+    height, width = first_left.shape[:2]
+    context = create_rectification_context(sequence_dir, (width, height), args)
+    estimate_sequence_refinement(pairs, context, args)
+    output_dir = sequence_dir / args.output_subdir
+    left_output_dir = output_dir / "left"
+    right_output_dir = output_dir / "right"
+    if args.output_subdir.startswith("images_"):
+        depth_output_name = "depth_gt_" + args.output_subdir[len("images_") :]
+    else:
+        depth_output_name = args.output_subdir + "_depth_gt"
+    depth_output_dir = sequence_dir / depth_output_name
+    parameters_path = output_dir / "rectification_parameters.json"
+    parameters = batch_parameters(sequence_dir, context, args)
+    parameters["depth_rectification"].update(
+        {
+            "source_available": depth_source_dir.is_dir(),
+            "applied": rectify_depth,
+            "output_dir": str(depth_output_dir) if rectify_depth else None,
+        }
+    )
+    has_existing_outputs = (
+        any(left_output_dir.glob("*.png"))
+        or any(right_output_dir.glob("*.png"))
+        or (rectify_depth and any(depth_output_dir.glob("*.png")))
+    )
+    if args.resume and has_existing_outputs:
+        if not parameters_path.exists():
+            raise FileNotFoundError(
+                "Cannot safely resume without existing rectification parameters: "
+                f"{parameters_path}"
+            )
+        previous_parameters = load_json(parameters_path)
+        if rectification_signature(previous_parameters) != rectification_signature(
+            parameters
+        ):
+            raise RuntimeError(
+                "Existing outputs use different rectification parameters; "
+                f"use --overwrite for sequence {sequence_dir.name}"
+            )
+    parameters["pair_counts"] = {
+        "available": len(all_pairs),
+        "selected": len(pairs),
+        "processed": 0,
+        "skipped": 0,
+        "depth_processed": 0,
+    }
+    write_json(parameters_path, parameters)
+    processed = 0
+    skipped = 0
+    depth_processed = 0
+    preview_pair = None
+    for pair_index, (left_path, right_path) in enumerate(pairs, start=1):
+        left_output = left_output_dir / left_path.name
+        right_output = right_output_dir / right_path.name
+        depth_output = depth_output_dir / left_path.name
+        left_exists = left_output.exists()
+        right_exists = right_output.exists()
+        depth_exists = depth_output.exists() if rectify_depth else True
+        complete = left_exists and right_exists and depth_exists
+        if complete and args.resume:
+            skipped += 1
+            continue
+        if (left_exists or right_exists or (rectify_depth and depth_exists)) and not (
+            args.resume or args.overwrite
+        ):
+            raise FileExistsError(
+                "Rectified output exists; use --resume for matching parameters "
+                f"or --overwrite: {left_output}, {right_output}, {depth_output}"
+            )
+        need_left = args.overwrite or not left_exists
+        need_right = args.overwrite or not right_exists
+        need_depth = rectify_depth and (args.overwrite or not depth_exists)
+        if need_left or need_right:
+            left_image = read_image(left_path)
+            right_image = read_image(right_path)
+            left_rectified, right_rectified = rectify_with_context(
+                left_image,
+                right_image,
+                context,
+                context.vertical_refinement_applied,
+            )
+            if need_left:
+                write_image(left_output, left_rectified, args.overwrite)
+            if need_right:
+                write_image(right_output, right_rectified, args.overwrite)
+            if preview_pair is None:
+                preview_pair = (left_rectified, right_rectified)
+        if need_depth:
+            depth = read_image_unchanged(depth_source_dir / left_path.name)
+            if depth.ndim != 2 or depth.shape != (height, width):
+                raise ValueError(
+                    f"Invalid depth shape for {left_path.name}: {depth.shape}; "
+                    f"expected {(height, width)}"
+                )
+            depth_rectified = cv2.remap(
+                depth,
+                context.map_left_x,
+                context.map_left_y,
+                interpolation=cv2.INTER_NEAREST,
+                borderMode=cv2.BORDER_CONSTANT,
+                borderValue=0,
+            )
+            write_image(depth_output, depth_rectified, args.overwrite)
+            depth_processed += 1
+        processed += 1
+        if pair_index % 25 == 0 or pair_index == len(pairs):
+            print(
+                f"[{sequence_dir.name}] {pair_index}/{len(pairs)} pairs "
+                f"(processed={processed}, skipped={skipped}, "
+                f"depth={depth_processed})",
+                flush=True,
+            )
+    if preview_pair is not None:
+        write_image(
+            output_dir / "epipolar_preview.png",
+            build_preview(*preview_pair),
+            overwrite=True,
+        )
+    parameters["pair_counts"] = {
+        "available": len(all_pairs),
+        "selected": len(pairs),
+        "processed": processed,
+        "skipped": skipped,
+        "depth_processed": depth_processed,
+    }
+    write_json(parameters_path, parameters)
+    return {
+        "sequence": sequence_dir.name,
+        "status": "completed",
+        "output_dir": str(output_dir),
+        "depth_output_dir": str(depth_output_dir) if rectify_depth else None,
+        "pairs_available": len(all_pairs),
+        "pairs_selected": len(pairs),
+        "pairs_processed": processed,
+        "pairs_skipped": skipped,
+        "depth_frames_processed": depth_processed,
+        "input_treated_as_already_undistorted": context.zero_distortion,
+        "vertical_before": context.feature_validation[
+            "before_vertical_refinement"
+        ],
+        "vertical_after": context.feature_validation[
+            "after_vertical_refinement"
+        ],
+    }
+
+def batch_main(args: argparse.Namespace) -> int:
+    root = args.input_root.expanduser().resolve()
+    sequences = discover_sequences(root, args.sequence)
+    print(
+        f"batch_root={root} sequences={len(sequences)} "
+        f"output_subdir={args.output_subdir}",
+        flush=True,
+    )
+    reports = []
+    for index, sequence_dir in enumerate(sequences, start=1):
+        print(
+            f"sequence {index}/{len(sequences)}: {sequence_dir.name}", flush=True
+        )
+        try:
+            reports.append(process_sequence_batch(sequence_dir, args))
+        except Exception as error:
+            reports.append(
+                {
+                    "sequence": sequence_dir.name,
+                    "status": "failed",
+                    "error": str(error),
+                }
+            )
+            print(f"[{sequence_dir.name}] failed: {error}", file=sys.stderr, flush=True)
+    summary = {
+        "input_root": str(root),
+        "output_subdir": args.output_subdir,
+        "sequence_count": len(sequences),
+        "completed_sequences": sum(
+            report["status"] == "completed" for report in reports
+        ),
+        "failed_sequences": sum(report["status"] == "failed" for report in reports),
+        "pairs_processed": sum(report.get("pairs_processed", 0) for report in reports),
+        "pairs_skipped": sum(report.get("pairs_skipped", 0) for report in reports),
+        "depth_frames_processed": sum(
+            report.get("depth_frames_processed", 0) for report in reports
+        ),
+        "sequences": reports,
+    }
+    report_path = root / f"{args.output_subdir}_batch_report.json"
+    write_json(report_path, summary)
+    print(f"batch_report={report_path}", flush=True)
+    print(
+        f"completed_sequences={summary['completed_sequences']} "
+        f"failed_sequences={summary['failed_sequences']} "
+        f"pairs_processed={summary['pairs_processed']} "
+        f"pairs_skipped={summary['pairs_skipped']} "
+        f"depth_frames_processed={summary['depth_frames_processed']}",
+        flush=True,
+    )
+    return 1 if summary["failed_sequences"] else 0
+
+def single_main(args: argparse.Namespace) -> int:
     left_path = args.left.expanduser().resolve()
     right_path = args.right.expanduser().resolve()
     intrinsics_path = args.intrinsics.expanduser().resolve()
@@ -398,13 +1066,16 @@ def main() -> int:
 
     intrinsics = load_json(intrinsics_path)
     extrinsics = load_json(extrinsics_path)
+    zero_distortion = args.distortion_mode == "already-undistorted"
     camera_left, distortion_left = scaled_camera_matrix(
         intrinsics[args.left_key],
         image_size,
+        zero_distortion,
     )
     camera_right, distortion_right = scaled_camera_matrix(
         intrinsics[args.right_key],
         image_size,
+        zero_distortion,
     )
     rotation_left_to_right, translation_left_to_right = left_to_right_extrinsics(
         extrinsics[args.extrinsic_key],
@@ -617,6 +1288,13 @@ def main() -> int:
             file=sys.stderr,
         )
     return 0
+
+
+def main() -> int:
+    args = parse_args()
+    if args.input_root is not None:
+        return batch_main(args)
+    return single_main(args)
 
 
 if __name__ == "__main__":
