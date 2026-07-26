@@ -123,7 +123,7 @@ def main():
     hint_padded = padder.pad(hint_batch)[0]
 
     with torch.no_grad():
-        depth_predictions, _, _, _, _, _ = model(
+        depth_predictions, _, _, _, propagated_padded, confidence_padded = model(
             image1_padded,
             image2_padded,
             sparse=hint_padded,
@@ -133,6 +133,20 @@ def main():
 
     prediction = (
         padder.unpad(depth_predictions[-1].unsqueeze(1))
+        .cpu()
+        .squeeze()
+        .numpy()
+        .astype(np.float32)
+    )
+    propagated_disparity = (
+        padder.unpad(propagated_padded)
+        .cpu()
+        .squeeze()
+        .numpy()
+        .astype(np.float32)
+    )
+    confidence_map = (
+        padder.unpad(confidence_padded)
         .cpu()
         .squeeze()
         .numpy()
@@ -172,12 +186,63 @@ def main():
     depth_max = float(gt_values.max())
     error_max = max(float(np.quantile(errors, 0.95)), 0.1)
     left_rgb = image1.permute(1, 2, 0).byte().numpy()
+    right_rgb = image2.permute(1, 2, 0).byte().numpy()
+    sparse_disparity = hint.squeeze().numpy().astype(np.float32)
+    sparse_valid = np.isfinite(sparse_disparity) & (sparse_disparity > 0)
+    sparse_lidar_depth = np.zeros_like(sparse_disparity, dtype=np.float32)
+    sparse_lidar_depth[sparse_valid] = (
+        float(conversion_rate) / sparse_disparity[sparse_valid]
+    )
+    propagated_valid = (
+        np.isfinite(propagated_disparity) & (propagated_disparity > 0)
+    )
+    confidence_valid = np.isfinite(confidence_map)
+    sparse_depth_max = float(np.quantile(sparse_lidar_depth[sparse_valid], 0.99))
+    propagated_max = float(np.quantile(propagated_disparity[propagated_valid], 0.99))
 
     np.save(cli.output_dir / "prediction_depth.npy", prediction)
     np.save(cli.output_dir / "gt_depth.npy", gt_depth)
     np.save(cli.output_dir / "absolute_error.npy", absolute_error)
     np.save(cli.output_dir / "evaluation_mask.npy", metric_mask)
+    np.save(cli.output_dir / "sparse_lidar_disparity.npy", sparse_disparity)
+    np.save(cli.output_dir / "sparse_lidar_depth.npy", sparse_lidar_depth)
+    np.save(cli.output_dir / "propagated_disparity.npy", propagated_disparity)
+    np.save(cli.output_dir / "confidence_map.npy", confidence_map)
     plt.imsave(cli.output_dir / "left_rectified_crop10.png", left_rgb)
+    plt.imsave(cli.output_dir / "right_rectified_crop10.png", right_rgb)
+    plt.imsave(cli.output_dir / "left_image.png", left_rgb)
+    plt.imsave(cli.output_dir / "right_image.png", right_rgb)
+
+    save_heatmap(
+        cli.output_dir / "sparse_lidar.png",
+        sparse_lidar_depth,
+        sparse_valid,
+        "turbo",
+        0.0,
+        sparse_depth_max,
+        "Sparse LiDAR",
+        "Depth (m)",
+    )
+    save_heatmap(
+        cli.output_dir / "propagated_disparity.png",
+        propagated_disparity,
+        propagated_valid,
+        "turbo",
+        0.0,
+        propagated_max,
+        "Propagated disparity",
+        "Disparity (px)",
+    )
+    save_heatmap(
+        cli.output_dir / "confidence_map.png",
+        confidence_map,
+        confidence_valid,
+        "gray",
+        0.0,
+        1.0,
+        "Confidence map",
+        "Confidence",
+    )
 
     prediction_valid = np.isfinite(prediction) & (prediction > 0)
     save_heatmap(
@@ -188,6 +253,16 @@ def main():
         depth_min,
         depth_max,
         "Predicted depth",
+        "Depth (m)",
+    )
+    save_heatmap(
+        cli.output_dir / "depth.png",
+        prediction,
+        prediction_valid,
+        "turbo",
+        depth_min,
+        depth_max,
+        "Depth",
         "Depth (m)",
     )
     save_heatmap(
@@ -252,6 +327,53 @@ def main():
     fig.savefig(cli.output_dir / "comparison.png", dpi=160)
     plt.close(fig)
 
+    panel_fig, panel_axes = plt.subplots(2, 3, figsize=(18, 10), constrained_layout=True)
+    panel_axes = panel_axes.ravel()
+    panel_axes[0].imshow(left_rgb)
+    panel_axes[0].set_title("Left image")
+    panel_axes[1].imshow(right_rgb)
+    panel_axes[1].set_title("Right image")
+    sparse_image = panel_axes[2].imshow(
+        np.ma.masked_where(~sparse_valid, sparse_lidar_depth),
+        cmap="turbo",
+        vmin=0.0,
+        vmax=sparse_depth_max,
+    )
+    panel_axes[2].set_title("Sparse LiDAR")
+    propagated_image = panel_axes[3].imshow(
+        np.ma.masked_where(~propagated_valid, propagated_disparity),
+        cmap="turbo",
+        vmin=0.0,
+        vmax=propagated_max,
+    )
+    panel_axes[3].set_title("Propagated disparity")
+    confidence_image = panel_axes[4].imshow(
+        np.ma.masked_where(~confidence_valid, confidence_map),
+        cmap="gray",
+        vmin=0.0,
+        vmax=1.0,
+    )
+    panel_axes[4].set_title("Confidence map")
+    depth_image = panel_axes[5].imshow(
+        np.ma.masked_where(~prediction_valid, prediction),
+        cmap="turbo",
+        vmin=depth_min,
+        vmax=depth_max,
+    )
+    panel_axes[5].set_title("Depth")
+    for axis in panel_axes:
+        axis.axis("off")
+    panel_fig.colorbar(sparse_image, ax=panel_axes[2], shrink=0.72, label="Depth (m)")
+    panel_fig.colorbar(
+        propagated_image, ax=panel_axes[3], shrink=0.72, label="Disparity (px)"
+    )
+    panel_fig.colorbar(
+        confidence_image, ax=panel_axes[4], shrink=0.72, label="Confidence"
+    )
+    panel_fig.colorbar(depth_image, ax=panel_axes[5], shrink=0.72, label="Depth (m)")
+    panel_fig.savefig(cli.output_dir / "six_outputs.png", dpi=160)
+    plt.close(panel_fig)
+
     metrics = {
         "sequence": cli.sequence,
         "frame": frame,
@@ -270,6 +392,12 @@ def main():
             np.mean(errors / np.maximum(gt_values, 1e-6)) * 100.0
         ),
         "absolute_error_p95_m": float(np.quantile(errors, 0.95)),
+        "sparse_lidar_pixels": int(sparse_valid.sum()),
+        "propagated_disparity_min_px": float(propagated_disparity[propagated_valid].min()),
+        "propagated_disparity_max_px": float(propagated_disparity[propagated_valid].max()),
+        "confidence_min": float(confidence_map[confidence_valid].min()),
+        "confidence_max": float(confidence_map[confidence_valid].max()),
+        "confidence_mean": float(confidence_map[confidence_valid].mean()),
     }
     with open(cli.output_dir / "metrics.json", "w", encoding="utf-8") as handle:
         json.dump(metrics, handle, indent=2)
