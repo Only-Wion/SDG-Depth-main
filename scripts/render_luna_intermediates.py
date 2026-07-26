@@ -15,6 +15,7 @@ def parse_args():
         description="Render saved Luna intermediate NumPy arrays."
     )
     parser.add_argument("--input-dir", type=Path, required=True)
+    parser.add_argument("--sparse-point-size", type=float, default=12.0)
     return parser.parse_args()
 
 
@@ -35,8 +36,35 @@ def save_map(path, values, valid, cmap_name, vmin, vmax, title, label):
     plt.close(fig)
 
 
+def save_sparse_lidar(path, depth, valid, vmax, point_size):
+    y, x = np.nonzero(valid)
+    fig, ax = plt.subplots(figsize=(12, 8), constrained_layout=True)
+    image = ax.scatter(
+        x,
+        y,
+        c=depth[valid],
+        s=point_size,
+        cmap="turbo",
+        vmin=0.0,
+        vmax=vmax,
+        marker="s",
+        linewidths=0,
+    )
+    ax.set_xlim(-0.5, depth.shape[1] - 0.5)
+    ax.set_ylim(depth.shape[0] - 0.5, -0.5)
+    ax.set_aspect("equal")
+    ax.set_facecolor("white")
+    ax.set_title("Sparse LiDAR")
+    ax.axis("off")
+    fig.colorbar(image, ax=ax, shrink=0.85, label="Depth (m)")
+    fig.savefig(path, dpi=160, facecolor="white")
+    plt.close(fig)
+
+
 def main():
     args = parse_args()
+    if args.sparse_point_size <= 0:
+        raise ValueError("--sparse-point-size must be positive")
     directory = args.input_dir
     sparse_depth = np.load(directory / "sparse_lidar_depth.npy")
     propagated = np.load(directory / "propagated_disparity.npy")
@@ -53,15 +81,12 @@ def main():
     propagated_max = float(np.quantile(propagated[propagated_valid], 0.99))
     depth_min, depth_max = np.quantile(depth[depth_valid], [0.01, 0.99])
 
-    save_map(
+    save_sparse_lidar(
         directory / "sparse_lidar.png",
         sparse_depth,
         sparse_valid,
-        "turbo",
-        0.0,
         sparse_max,
-        "Sparse LiDAR",
-        "Depth (m)",
+        args.sparse_point_size,
     )
     save_map(
         directory / "propagated_disparity.png",
@@ -97,12 +122,22 @@ def main():
     axes[0].set_title("Left image")
     axes[1].imshow(right)
     axes[1].set_title("Right image")
-    sparse_image = axes[2].imshow(
-        np.ma.masked_where(~sparse_valid, sparse_depth),
+    sparse_y, sparse_x = np.nonzero(sparse_valid)
+    sparse_image = axes[2].scatter(
+        sparse_x,
+        sparse_y,
+        c=sparse_depth[sparse_valid],
+        s=max(args.sparse_point_size * 0.5, 1.0),
         cmap=sparse_cmap,
         vmin=0.0,
         vmax=sparse_max,
+        marker="s",
+        linewidths=0,
     )
+    axes[2].set_xlim(-0.5, sparse_depth.shape[1] - 0.5)
+    axes[2].set_ylim(sparse_depth.shape[0] - 0.5, -0.5)
+    axes[2].set_aspect("equal")
+    axes[2].set_facecolor("white")
     axes[2].set_title("Sparse LiDAR")
     propagated_image = axes[3].imshow(
         np.ma.masked_where(~propagated_valid, propagated),
