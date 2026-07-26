@@ -3,6 +3,7 @@ import argparse
 import csv
 import json
 import sys
+import time
 from pathlib import Path
 
 import matplotlib
@@ -35,6 +36,7 @@ def parse_args():
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--keep", type=int, default=5)
+    parser.add_argument("--warmup", type=int, default=5)
     return parser.parse_args()
 
 
@@ -48,6 +50,8 @@ def infer_sample(model, sample, device):
     image1_padded, image2_padded = padder.pad(image1_batch, image2_batch)
     hint_padded = padder.pad(hint_batch)[0]
 
+    torch.cuda.synchronize(device)
+    inference_start = time.perf_counter()
     with torch.no_grad():
         depth_predictions, _, _, _, _, _ = model(
             image1_padded,
@@ -56,6 +60,8 @@ def infer_sample(model, sample, device):
             sparse_mask=(hint_padded > 0).int(),
             conversion_rate=conversion_batch,
         )
+    torch.cuda.synchronize(device)
+    inference_time_ms = (time.perf_counter() - inference_start) * 1000.0
 
     prediction = (
         padder.unpad(depth_predictions[-1].unsqueeze(1))
@@ -108,6 +114,7 @@ def infer_sample(model, sample, device):
             np.mean(errors / np.maximum(gt_values, 1e-6)) * 100.0
         ),
         "absolute_error_p95_m": float(np.quantile(errors, 0.95)),
+        "inference_time_ms": inference_time_ms,
     }
     return {
         "metrics": info,
@@ -228,6 +235,8 @@ def main():
     cli = parse_args()
     if cli.keep <= 0:
         raise ValueError("--keep must be positive")
+    if cli.warmup < 0:
+        raise ValueError("--warmup must be non-negative")
     cli.output_dir.mkdir(parents=True, exist_ok=True)
 
     args = model_and_dataset_args()
@@ -246,9 +255,13 @@ def main():
     model.load_state_dict(checkpoint["model"], strict=True)
     model.eval()
 
+    for _ in range(cli.warmup):
+        infer_sample(model, dataset[0], device)
+
     top_results = []
     all_metrics = []
     skipped = 0
+    evaluation_start = time.perf_counter()
     for index in range(len(dataset)):
         result = infer_sample(model, dataset[index], device)
         if result is None:
@@ -264,6 +277,7 @@ def main():
             f'{result["metrics"]["sequence"]}/frame{result["metrics"]["frame"]} '
             f'MAPE={result["metrics"]["mape_percent"]:.4f}%'
         )
+    evaluation_time_s = time.perf_counter() - evaluation_start
 
     all_metrics.sort(key=lambda item: item["mape_percent"])
     for rank, result in enumerate(top_results, start=1):
@@ -280,6 +294,23 @@ def main():
             writer.writeheader()
             writer.writerows(all_metrics)
 
+    inference_times = np.array(
+        [metrics["inference_time_ms"] for metrics in all_metrics],
+        dtype=np.float64,
+    )
+    timing = {
+        "warmup_iterations": cli.warmup,
+        "model_inference_mean_ms": float(inference_times.mean()),
+        "model_inference_median_ms": float(np.median(inference_times)),
+        "model_inference_p95_ms": float(np.quantile(inference_times, 0.95)),
+        "model_inference_min_ms": float(inference_times.min()),
+        "model_inference_max_ms": float(inference_times.max()),
+        "model_inference_fps": float(1000.0 / inference_times.mean()),
+        "evaluation_loop_total_s": evaluation_time_s,
+        "evaluation_loop_mean_ms_per_frame": float(
+            evaluation_time_s * 1000.0 / len(dataset)
+        ),
+    }
     summary = {
         "checkpoint": str(cli.checkpoint),
         "split": "test",
@@ -288,6 +319,7 @@ def main():
         "evaluated_samples": len(all_metrics),
         "skipped_samples": skipped,
         "kept_samples": len(top_results),
+        "timing": timing,
         "top5": [result["metrics"] for result in top_results],
     }
     with open(cli.output_dir / "summary.json", "w", encoding="utf-8") as handle:
