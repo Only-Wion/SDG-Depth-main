@@ -46,6 +46,8 @@ class LunaOrganized(data.Dataset):
         self.camera_key = getattr(args, 'luna_camera_key', 'Cam_Rect_L')
         self.apply_rectification = bool(getattr(args, 'luna_apply_rectification', 1))
         self.image_subdir = Path(getattr(args, 'luna_image_subdir', 'images'))
+        self.left_dirname = getattr(args, 'luna_left_dirname', 'left')
+        self.right_dirname = getattr(args, 'luna_right_dirname', 'right')
         self.depth_subdir = Path(getattr(args, 'luna_depth_subdir', 'depth_gt'))
         self.lidar_source = getattr(args, 'luna_lidar_source', 'raw')
         if self.lidar_source not in {'raw', 'fastlio'}:
@@ -88,7 +90,8 @@ class LunaOrganized(data.Dataset):
         if excluded_sequences:
             logging.info(f'Excluding Luna sequences: {sorted(excluded_sequences)}')
         logging.info(
-            f'Luna inputs: images={self.image_subdir}, depth={self.depth_subdir}, '
+            f'Luna inputs: images={self.image_subdir}/'
+            f'{self.left_dirname},{self.right_dirname}, depth={self.depth_subdir}, '
             f'lidar={self.lidar_source}, border_crop={self.border_crop_fraction:.1%}'
         )
         for seq in sorted([p for p in self.root.iterdir() if p.is_dir()]):
@@ -96,8 +99,8 @@ class LunaOrganized(data.Dataset):
                 continue
             if not (seq / 'manifest.json').exists() and not (seq / 'calibration').exists():
                 continue
-            left_dir = seq / self.image_subdir / 'left'
-            right_dir = seq / self.image_subdir / 'right'
+            left_dir = seq / self.image_subdir / self.left_dirname
+            right_dir = seq / self.image_subdir / self.right_dirname
             depth_dir = seq / self.depth_subdir
             lidar_root = seq / f'lidar_{self.lidar_source}'
             lidar_dir = lidar_root / 'frames'

@@ -43,6 +43,8 @@ def model_and_dataset_args():
         luna_camera_key="Cam_Rect_L",
         luna_apply_rectification=1,
         luna_image_subdir="images_rectified",
+        luna_left_dirname="left",
+        luna_right_dirname="right",
         luna_depth_subdir="depth_gt_rectified",
         luna_lidar_source="fastlio",
         luna_border_crop_fraction=0.1,

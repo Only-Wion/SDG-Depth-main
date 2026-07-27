@@ -59,6 +59,10 @@ parser.add_argument('--luna_exclude_sequences', nargs='*', default=[],
                     help='Luna sequence directory names to exclude before train/val/test splitting')
 parser.add_argument('--luna_image_subdir', default='images', type=str,
                     help='per-sequence directory containing left/right Luna images')
+parser.add_argument('--luna_left_dirname', default='left', type=str,
+                    help='left image directory inside luna_image_subdir')
+parser.add_argument('--luna_right_dirname', default='right', type=str,
+                    help='right image directory inside luna_image_subdir')
 parser.add_argument('--luna_depth_subdir', default='depth_gt', type=str,
                     help='per-sequence directory containing Luna depth PNGs')
 parser.add_argument('--luna_lidar_source', default='raw', choices=['raw', 'fastlio'],

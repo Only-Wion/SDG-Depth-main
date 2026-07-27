@@ -137,36 +137,38 @@ def save_comparison(path, result):
     depth_cmap.set_bad("black")
     error_cmap.set_bad("black")
 
-    fig, axes = plt.subplots(1, 3, figsize=(18, 6), constrained_layout=True)
-    pred_image = axes[0].imshow(
+    fig, axes = plt.subplots(1, 4, figsize=(24, 6), constrained_layout=True)
+    axes[0].imshow(result["left_rgb"])
+    axes[0].set_title("Input left image")
+    pred_image = axes[1].imshow(
         np.ma.masked_where(~mask, result["prediction"]),
         cmap=depth_cmap,
         vmin=depth_min,
         vmax=depth_max,
     )
-    axes[0].set_title("Prediction")
-    axes[1].imshow(
+    axes[1].set_title("Prediction")
+    axes[2].imshow(
         np.ma.masked_where(~mask, result["gt_depth"]),
         cmap=depth_cmap,
         vmin=depth_min,
         vmax=depth_max,
     )
-    axes[1].set_title("Ground truth")
-    error_image = axes[2].imshow(
+    axes[2].set_title("Ground truth")
+    error_image = axes[3].imshow(
         np.ma.masked_where(~mask, result["absolute_error"]),
         cmap=error_cmap,
         vmin=0.0,
         vmax=error_max,
     )
-    axes[2].set_title("Absolute error")
+    axes[3].set_title("Absolute error")
     for axis in axes:
         axis.axis("off")
     fig.colorbar(
-        pred_image, ax=axes[:2], shrink=0.82, label="Depth (m)", location="bottom"
+        pred_image, ax=axes[1:3], shrink=0.82, label="Depth (m)", location="bottom"
     )
     fig.colorbar(
         error_image,
-        ax=axes[2],
+        ax=axes[3],
         shrink=0.82,
         label="Absolute error (m)",
         location="bottom",

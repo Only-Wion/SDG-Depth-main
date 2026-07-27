@@ -27,6 +27,9 @@ def parse_args():
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--sequence", required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--image-subdir", default="images_rectified")
+    parser.add_argument("--left-dirname", default="left")
+    parser.add_argument("--right-dirname", default="right")
     parser.add_argument("--warmup", type=int, default=5)
     return parser.parse_args()
 
@@ -54,6 +57,9 @@ def main():
     args.luna_exclude_sequences = []
     args.luna_val_fraction = 0.0
     args.luna_test_fraction = 0.0
+    args.luna_image_subdir = cli.image_subdir
+    args.luna_left_dirname = cli.left_dirname
+    args.luna_right_dirname = cli.right_dirname
     dataset = LunaOrganized(
         aug_params={},
         root=str(cli.root),
@@ -156,7 +162,10 @@ def main():
         "checkpoint": str(cli.checkpoint),
         "input_mode": {
             "split": "all",
-            "images": "images_rectified",
+            "images": (
+                f"{cli.image_subdir}/"
+                f"{cli.left_dirname},{cli.right_dirname}"
+            ),
             "depth_gt": "depth_gt_rectified",
             "lidar": "fastlio",
             "border_crop_fraction": 0.1,
