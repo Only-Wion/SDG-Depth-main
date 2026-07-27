@@ -26,7 +26,9 @@ def parse_args():
     )
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--sequence", required=True)
-    parser.add_argument("--output-root", type=Path, required=True)
+    output = parser.add_mutually_exclusive_group(required=True)
+    output.add_argument("--output-root", type=Path)
+    output.add_argument("--output-sequence-dir", type=Path)
     parser.add_argument("--image-subdir", default="images_rectified")
     parser.add_argument("--left-dirname", default="left_out")
     parser.add_argument("--right-dirname", default="right_out")
@@ -92,7 +94,11 @@ def back_project_to_lidar(
 
 def main():
     cli = parse_args()
-    output_sequence = cli.output_root / cli.sequence
+    output_sequence = (
+        cli.output_sequence_dir
+        if cli.output_sequence_dir is not None
+        else cli.output_root / cli.sequence
+    )
     pcd_dir = output_sequence / "frames"
     sample_dir = output_sequence / "samples"
     pcd_dir.mkdir(parents=True, exist_ok=True)
