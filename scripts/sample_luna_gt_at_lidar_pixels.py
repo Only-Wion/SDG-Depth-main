@@ -82,8 +82,8 @@ def back_project_to_lidar(
     rectification = calibration["rect_r"].astype(np.float64)
     xyz_camera = xyz_rectified @ rectification
     lidar_to_camera = calibration["lidar_to_cam"].astype(np.float64)
-    rotation = lidar_to_camera[:, :3]
-    translation = lidar_to_camera[:, 3]
+    rotation = lidar_to_camera[:3, :3]
+    translation = lidar_to_camera[:3, 3]
     xyz_lidar = np.linalg.solve(
         rotation, (xyz_camera - translation).T
     ).T
