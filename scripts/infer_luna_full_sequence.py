@@ -8,6 +8,7 @@ from pathlib import Path
 import matplotlib
 
 matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
@@ -30,6 +31,11 @@ def parse_args():
     parser.add_argument("--image-subdir", default="images_rectified")
     parser.add_argument("--left-dirname", default="left")
     parser.add_argument("--right-dirname", default="right")
+    parser.add_argument("--depth-subdir", default="depth_gt_rectified")
+    parser.add_argument(
+        "--lidar-source", choices=["raw", "fastlio", "fake"], default="fastlio"
+    )
+    parser.add_argument("--border-crop-fraction", type=float, default=0.1)
     parser.add_argument("--warmup", type=int, default=5)
     return parser.parse_args()
 
@@ -60,6 +66,9 @@ def main():
     args.luna_image_subdir = cli.image_subdir
     args.luna_left_dirname = cli.left_dirname
     args.luna_right_dirname = cli.right_dirname
+    args.luna_depth_subdir = cli.depth_subdir
+    args.luna_lidar_source = cli.lidar_source
+    args.luna_border_crop_fraction = cli.border_crop_fraction
     dataset = LunaOrganized(
         aug_params={},
         root=str(cli.root),
@@ -73,7 +82,8 @@ def main():
     ]
     if not sample_indices:
         raise FileNotFoundError(
-            f"No valid FAST-LIO-paired samples found for sequence {cli.sequence}"
+            f"No valid {cli.lidar_source} LiDAR-paired samples found for "
+            f"sequence {cli.sequence}"
         )
 
     device = torch.device("cuda")
@@ -101,6 +111,11 @@ def main():
         metrics = result["metrics"]
         frame_dir = cli.output_dir / f'frame{metrics["frame"]}'
         frame_dir.mkdir(parents=True, exist_ok=True)
+        np.save(frame_dir / "prediction_depth.npy", result["prediction"])
+        np.save(frame_dir / "gt_depth.npy", result["gt_depth"])
+        np.save(frame_dir / "absolute_error.npy", result["absolute_error"])
+        np.save(frame_dir / "evaluation_mask.npy", result["metric_mask"])
+        plt.imsave(frame_dir / "model_input.png", result["left_rgb"])
         save_comparison(frame_dir / "comparison.png", result)
         with open(frame_dir / "metrics.json", "w", encoding="utf-8") as handle:
             json.dump(metrics, handle, indent=2)
@@ -166,9 +181,9 @@ def main():
                 f"{cli.image_subdir}/"
                 f"{cli.left_dirname},{cli.right_dirname}"
             ),
-            "depth_gt": "depth_gt_rectified",
-            "lidar": "fastlio",
-            "border_crop_fraction": 0.1,
+            "depth_gt": cli.depth_subdir,
+            "lidar": cli.lidar_source,
+            "border_crop_fraction": cli.border_crop_fraction,
             "depth_percentile_interval": [0.05, 0.95],
         },
         "paired_frames": len(sample_indices),
