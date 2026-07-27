@@ -87,6 +87,8 @@ parser.add_argument('--resume_ckpt', type=str, help="restore checkpoint")
 parser.add_argument('--strict_resume', default=1, type=int)
 parser.add_argument('--resume_optimizer', default=1, type=int)
 parser.add_argument('--resume_epoch', default=1, type=int)
+parser.add_argument('--reset_best_val', default=0, type=int,
+                    help='ignore validation metrics stored in the resume checkpoint')
 
 parser.add_argument('--pred_hint_weight', default=0.6, type=float)
 parser.add_argument('--disp_to_depth_convert_loss_weight1', default=0, type=float, help='')
@@ -297,12 +299,16 @@ def main(args):
         checkpoint = torch.load(args.resume_ckpt, map_location=loc)
         model_without_ddp.load_state_dict(checkpoint['model'], strict=args.strict_resume)
         resume_val_metrics = checkpoint.get('val_metrics', {})
-        if 'rmse' in resume_val_metrics:
+        if 'rmse' in resume_val_metrics and not args.reset_best_val:
             best_val_rmse = float(resume_val_metrics['rmse'])
             best_path = Path(args.checkpoint_dir) / 'ckpt_best.pth'
             if not best_path.exists():
                 torch.save(checkpoint, best_path)
             logging.info(f"Using resumed validation RMSE as best baseline: {best_val_rmse}")
+        elif 'rmse' in resume_val_metrics:
+            logging.info(
+                "Ignoring resumed validation RMSE because reset_best_val is enabled"
+            )
         del checkpoint
 
     milestones = [int(milestone) for milestone in args.milestones.split(',')]
