@@ -26,7 +26,14 @@ def parse_args():
     )
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--checkpoint", type=Path, required=True)
-    parser.add_argument("--sequence", required=True)
+    parser.add_argument("--sequence")
+    parser.add_argument("--sequences", nargs="+")
+    parser.add_argument(
+        "--split", choices=["all", "training", "val", "test"], default="all"
+    )
+    parser.add_argument("--exclude-sequences", nargs="*", default=[])
+    parser.add_argument("--val-fraction", type=float, default=0.2)
+    parser.add_argument("--test-fraction", type=float, default=0.2)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--image-subdir", default="images_rectified")
     parser.add_argument("--left-dirname", default="left")
@@ -55,14 +62,17 @@ def distribution(values):
 
 def main():
     cli = parse_args()
+    selected_sequences = cli.sequences or ([cli.sequence] if cli.sequence else [])
+    if not selected_sequences:
+        raise ValueError("Pass --sequence or --sequences")
     if cli.warmup < 0:
         raise ValueError("--warmup must be non-negative")
     cli.output_dir.mkdir(parents=True, exist_ok=True)
 
     args = model_and_dataset_args()
-    args.luna_exclude_sequences = []
-    args.luna_val_fraction = 0.0
-    args.luna_test_fraction = 0.0
+    args.luna_exclude_sequences = cli.exclude_sequences
+    args.luna_val_fraction = cli.val_fraction
+    args.luna_test_fraction = cli.test_fraction
     args.luna_image_subdir = cli.image_subdir
     args.luna_left_dirname = cli.left_dirname
     args.luna_right_dirname = cli.right_dirname
@@ -72,18 +82,18 @@ def main():
     dataset = LunaOrganized(
         aug_params={},
         root=str(cli.root),
-        image_set="all",
+        image_set=cli.split,
         args=args,
     )
     sample_indices = [
         index
         for index, sample in enumerate(dataset.extra_info)
-        if sample["sequence"] == cli.sequence
+        if sample["sequence"] in selected_sequences
     ]
     if not sample_indices:
         raise FileNotFoundError(
             f"No valid {cli.lidar_source} LiDAR-paired samples found for "
-            f"sequence {cli.sequence}"
+            f"sequences {selected_sequences}"
         )
 
     device = torch.device("cuda")
@@ -109,13 +119,18 @@ def main():
             continue
 
         metrics = result["metrics"]
-        frame_dir = cli.output_dir / f'frame{metrics["frame"]}'
+        frame_dir = (
+            cli.output_dir
+            / metrics["sequence"]
+            / f'frame{metrics["frame"]}'
+        )
         frame_dir.mkdir(parents=True, exist_ok=True)
         np.save(frame_dir / "prediction_depth.npy", result["prediction"])
         np.save(frame_dir / "gt_depth.npy", result["gt_depth"])
         np.save(frame_dir / "absolute_error.npy", result["absolute_error"])
         np.save(frame_dir / "evaluation_mask.npy", result["metric_mask"])
-        plt.imsave(frame_dir / "model_input.png", result["left_rgb"])
+        plt.imsave(frame_dir / "model_input_left.png", result["left_rgb"])
+        plt.imsave(frame_dir / "model_input_right.png", result["right_rgb"])
         save_comparison(frame_dir / "comparison.png", result)
         with open(frame_dir / "metrics.json", "w", encoding="utf-8") as handle:
             json.dump(metrics, handle, indent=2)
@@ -173,10 +188,10 @@ def main():
         metrics["inference_time_ms"] for metrics in frame_metrics
     ]
     summary = {
-        "sequence": cli.sequence,
+        "sequences": selected_sequences,
         "checkpoint": str(cli.checkpoint),
         "input_mode": {
-            "split": "all",
+            "split": cli.split,
             "images": (
                 f"{cli.image_subdir}/"
                 f"{cli.left_dirname},{cli.right_dirname}"
