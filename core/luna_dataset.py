@@ -348,7 +348,7 @@ class LunaOrganized(data.Dataset):
         return np.stack([pcd['x'], pcd['y'], pcd['z']], axis=1).astype(np.float32)
 
     def _read_lidar_xyz(self, sample):
-        if self.lidar_source == 'raw':
+        if self.lidar_source in {'raw', 'fake'}:
             return self._read_pcd_xyz(sample['lidar'])
 
         with np.load(sample['lidar']) as cloud:
