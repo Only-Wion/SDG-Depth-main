@@ -61,6 +61,10 @@ def parse_args() -> argparse.Namespace:
         default="images_rectified",
         help="Per-sequence output directory name in batch mode.",
     )
+    parser.add_argument("--input-left-dirname", default="left")
+    parser.add_argument("--input-right-dirname", default="right")
+    parser.add_argument("--output-left-dirname", default="left")
+    parser.add_argument("--output-right-dirname", default="right")
     parser.add_argument(
         "--sequence",
         action="append",
@@ -151,6 +155,17 @@ def parse_args() -> argparse.Namespace:
     output_subdir = Path(args.output_subdir)
     if output_subdir.is_absolute() or ".." in output_subdir.parts:
         parser.error("--output-subdir must be relative and cannot contain '..'")
+    for option in (
+        "input_left_dirname",
+        "input_right_dirname",
+        "output_left_dirname",
+        "output_right_dirname",
+    ):
+        value = Path(getattr(args, option))
+        if value.is_absolute() or len(value.parts) != 1 or value.name in {"", ".."}:
+            parser.error(
+                f"--{option.replace('_', '-')} must be one relative directory name"
+            )
     if args.resume and args.overwrite:
         parser.error("--resume and --overwrite are mutually exclusive")
     return args
@@ -523,7 +538,12 @@ def write_json(path: Path, value: dict) -> None:
             temporary.unlink()
 
 
-def discover_sequences(root: Path, selected: list[str] | None) -> list[Path]:
+def discover_sequences(
+    root: Path,
+    selected: list[str] | None,
+    left_dirname: str = "left",
+    right_dirname: str = "right",
+) -> list[Path]:
     if not root.is_dir():
         raise NotADirectoryError(f"Batch input root does not exist: {root}")
     selected_set = set(selected or [])
@@ -534,8 +554,8 @@ def discover_sequences(root: Path, selected: list[str] | None) -> list[Path]:
         if selected_set and candidate.name not in selected_set:
             continue
         required = (
-            candidate / "images" / "left",
-            candidate / "images" / "right",
+            candidate / "images" / left_dirname,
+            candidate / "images" / right_dirname,
             candidate / "calibration" / "intrinsics.json",
             candidate / "calibration" / "extrinsics.json",
         )
@@ -553,9 +573,13 @@ def discover_sequences(root: Path, selected: list[str] | None) -> list[Path]:
     return sequences
 
 
-def paired_image_paths(sequence_dir: Path) -> list[tuple[Path, Path]]:
-    left_dir = sequence_dir / "images" / "left"
-    right_dir = sequence_dir / "images" / "right"
+def paired_image_paths(
+    sequence_dir: Path,
+    left_dirname: str = "left",
+    right_dirname: str = "right",
+) -> list[tuple[Path, Path]]:
+    left_dir = sequence_dir / "images" / left_dirname
+    right_dir = sequence_dir / "images" / right_dirname
     left = {path.name: path for path in left_dir.glob("*.png")}
     right = {path.name: path for path in right_dir.glob("*.png")}
     missing_right = sorted(left.keys() - right.keys())
@@ -927,7 +951,11 @@ def process_sequence_batch(
     sequence_dir: Path,
     args: argparse.Namespace,
 ) -> dict:
-    all_pairs = paired_image_paths(sequence_dir)
+    all_pairs = paired_image_paths(
+        sequence_dir,
+        args.input_left_dirname,
+        args.input_right_dirname,
+    )
     pairs = all_pairs[: args.limit] if args.limit is not None else all_pairs
     depth_source_dir = sequence_dir / "depth_gt"
     rectify_depth = depth_source_dir.is_dir() and not args.no_rectify_depth
@@ -952,14 +980,17 @@ def process_sequence_batch(
     context = create_rectification_context(sequence_dir, (width, height), args)
     estimate_sequence_refinement(pairs, context, args)
     output_dir = sequence_dir / args.output_subdir
-    left_output_dir = output_dir / "left"
-    right_output_dir = output_dir / "right"
+    left_output_dir = output_dir / args.output_left_dirname
+    right_output_dir = output_dir / args.output_right_dirname
+    output_variant = ""
+    if (args.output_left_dirname, args.output_right_dirname) != ("left", "right"):
+        output_variant = f"_{args.output_left_dirname}_{args.output_right_dirname}"
     if args.output_subdir.startswith("images_"):
         depth_output_name = "depth_gt_" + args.output_subdir[len("images_") :]
     else:
         depth_output_name = args.output_subdir + "_depth_gt"
     depth_output_dir = sequence_dir / depth_output_name
-    parameters_path = output_dir / "rectification_parameters.json"
+    parameters_path = output_dir / f"rectification_parameters{output_variant}.json"
     parameters = batch_parameters(sequence_dir, context, args)
     parameters["depth_rectification"].update(
         {
@@ -1062,7 +1093,7 @@ def process_sequence_batch(
             )
     if preview_pair is not None:
         write_image(
-            output_dir / "epipolar_preview.png",
+            output_dir / f"epipolar_preview{output_variant}.png",
             build_preview(*preview_pair),
             overwrite=True,
         )
@@ -1095,7 +1126,12 @@ def process_sequence_batch(
 
 def batch_main(args: argparse.Namespace) -> int:
     root = args.input_root.expanduser().resolve()
-    sequences = discover_sequences(root, args.sequence)
+    sequences = discover_sequences(
+        root,
+        args.sequence,
+        args.input_left_dirname,
+        args.input_right_dirname,
+    )
     print(
         f"batch_root={root} sequences={len(sequences)} "
         f"output_subdir={args.output_subdir}",
@@ -1132,7 +1168,12 @@ def batch_main(args: argparse.Namespace) -> int:
         ),
         "sequences": reports,
     }
-    report_path = root / f"{args.output_subdir}_batch_report.json"
+    report_variant = ""
+    if (args.output_left_dirname, args.output_right_dirname) != ("left", "right"):
+        report_variant = f"_{args.output_left_dirname}_{args.output_right_dirname}"
+    report_path = root / (
+        f"{args.output_subdir}{report_variant}_batch_report.json"
+    )
     write_json(report_path, summary)
     print(f"batch_report={report_path}", flush=True)
     print(
