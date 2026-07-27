@@ -50,7 +50,7 @@ class LunaOrganized(data.Dataset):
         self.right_dirname = getattr(args, 'luna_right_dirname', 'right')
         self.depth_subdir = Path(getattr(args, 'luna_depth_subdir', 'depth_gt'))
         self.lidar_source = getattr(args, 'luna_lidar_source', 'raw')
-        if self.lidar_source not in {'raw', 'fastlio'}:
+        if self.lidar_source not in {'raw', 'fastlio', 'fake'}:
             raise ValueError(f'Unsupported Luna LiDAR source: {self.lidar_source}')
         self.border_crop_fraction = float(
             getattr(args, 'luna_border_crop_fraction', 0.0)
