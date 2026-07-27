@@ -36,6 +36,12 @@ def parse_args():
     parser.add_argument("--sequence", required=True)
     parser.add_argument("--lidar-source", choices=("raw", "fastlio"), required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument(
+        "--geometry",
+        choices=("rectified", "original"),
+        default="rectified",
+        help="Choose matching camera/depth geometry.",
+    )
     parser.add_argument("--image-subdir", default="images_rectified")
     parser.add_argument("--left-dirname", default="left")
     parser.add_argument("--right-dirname", default="right")
@@ -68,6 +74,14 @@ def main():
     args.luna_left_dirname = cli.left_dirname
     args.luna_right_dirname = cli.right_dirname
     args.luna_lidar_source = cli.lidar_source
+    if cli.geometry == "original":
+        args.luna_depth_subdir = "depth_gt"
+        args.luna_camera_key = "Cam_L"
+        args.luna_apply_rectification = 0
+    else:
+        args.luna_depth_subdir = "depth_gt_rectified"
+        args.luna_camera_key = "Cam_Rect_L"
+        args.luna_apply_rectification = 1
     dataset = LunaOrganized(
         aug_params={},
         root=str(cli.root),
@@ -196,12 +210,15 @@ def main():
         "root": str(cli.root),
         "lidar_source": cli.lidar_source,
         "input_mode": {
+            "geometry": cli.geometry,
             "images": (
                 f"{cli.image_subdir}/"
                 f"{cli.left_dirname},{cli.right_dirname}"
             ),
             "depth_gt": args.luna_depth_subdir,
             "border_crop_fraction": args.luna_border_crop_fraction,
+            "camera_key": args.luna_camera_key,
+            "apply_rectification": bool(args.luna_apply_rectification),
         },
         "scope": (
             f"Projected {cli.lidar_source} LiDAR pixels with valid depth_gt; "
