@@ -52,6 +52,12 @@ class LunaOrganized(data.Dataset):
         self.lidar_source = getattr(args, 'luna_lidar_source', 'raw')
         if self.lidar_source not in {'raw', 'fastlio', 'fake'}:
             raise ValueError(f'Unsupported Luna LiDAR source: {self.lidar_source}')
+        body_to_lidar = getattr(args, 'luna_fastlio_body_to_lidar', None)
+        self.fastlio_body_to_lidar = (
+            np.eye(4, dtype=np.float64)
+            if body_to_lidar is None
+            else np.asarray(body_to_lidar, dtype=np.float64).reshape(4, 4)
+        )
         self.border_crop_fraction = float(
             getattr(args, 'luna_border_crop_fraction', 0.0)
         )
@@ -357,7 +363,14 @@ class LunaOrganized(data.Dataset):
             sample['calib']['trajectory'],
             sample['image_time_ns'],
         )
-        return ((map_points - position) @ map_from_body).astype(np.float32)
+        body_points = (map_points - position) @ map_from_body
+        body_h = np.concatenate(
+            [body_points, np.ones((body_points.shape[0], 1), dtype=np.float64)],
+            axis=1,
+        )
+        return (
+            self.fastlio_body_to_lidar @ body_h.T
+        ).T[:, :3].astype(np.float32)
 
     def _load_depth_m(self, filename):
         return np.array(Image.open(filename), dtype=np.float32) * self.depth_scale

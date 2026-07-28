@@ -67,6 +67,14 @@ parser.add_argument('--luna_depth_subdir', default='depth_gt', type=str,
                     help='per-sequence directory containing Luna depth PNGs')
 parser.add_argument('--luna_lidar_source', default='raw', choices=['raw', 'fastlio', 'fake'],
                     help='Luna sparse hint source')
+parser.add_argument(
+    '--luna_fastlio_body_to_lidar',
+    type=float,
+    nargs=16,
+    default=None,
+    metavar='M',
+    help='optional row-major 4x4 transform from FAST-LIO body coordinates to LiDAR coordinates',
+)
 parser.add_argument('--luna_resize', type=int, nargs='*', default=[768, 1024], help='resize Luna images/depth to H W; pass no values to keep original size')
 parser.add_argument('--luna_border_crop_fraction', default=0.0, type=float,
                     help='fraction cropped from each border after resize and LiDAR projection')

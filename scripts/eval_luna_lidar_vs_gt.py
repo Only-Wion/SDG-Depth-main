@@ -45,6 +45,13 @@ def parse_args():
     parser.add_argument("--image-subdir", default="images_rectified")
     parser.add_argument("--left-dirname", default="left")
     parser.add_argument("--right-dirname", default="right")
+    parser.add_argument(
+        "--fastlio-body-to-lidar",
+        type=float,
+        nargs=16,
+        metavar="M",
+        help="Optional row-major 4x4 transform from FAST-LIO body to LiDAR.",
+    )
     return parser.parse_args()
 
 
@@ -74,6 +81,7 @@ def main():
     args.luna_left_dirname = cli.left_dirname
     args.luna_right_dirname = cli.right_dirname
     args.luna_lidar_source = cli.lidar_source
+    args.luna_fastlio_body_to_lidar = cli.fastlio_body_to_lidar
     if cli.geometry == "original":
         args.luna_depth_subdir = "depth_gt"
         args.luna_camera_key = "Cam_L"
@@ -219,6 +227,11 @@ def main():
             "border_crop_fraction": args.luna_border_crop_fraction,
             "camera_key": args.luna_camera_key,
             "apply_rectification": bool(args.luna_apply_rectification),
+            "fastlio_body_to_lidar": (
+                np.asarray(args.luna_fastlio_body_to_lidar).reshape(4, 4).tolist()
+                if args.luna_fastlio_body_to_lidar is not None
+                else None
+            ),
         },
         "scope": (
             f"Projected {cli.lidar_source} LiDAR pixels with valid depth_gt; "
