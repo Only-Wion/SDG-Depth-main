@@ -287,12 +287,12 @@ class DDC_Module(nn.Module):
         c_rate = conversion_rate.unsqueeze(1).unsqueeze(1).unsqueeze(1).repeat(1, 1, disp.shape[-2], disp.shape[-1])
         if self.args.disp_to_depth_convert_gate == 3.8:
             mask = disp > self.args.disp_to_depth_convert_gate
-            depth = c_rate / (disp + 1e-6)+res_depth
+            depth = c_rate / (disp + 1e-6)
             depth = torch.where(mask, depth, depth_ori)
 
         else:
             mask = disp > self.args.disp_to_depth_convert_gate
-            depth = c_rate / (disp + 1e-6)+res_depth
+            depth = c_rate / (disp + 1e-6)
 
         depth = torch.clamp(depth, min=0, max=100.)
 
